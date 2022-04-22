@@ -22,7 +22,7 @@ def _extract_config_from_archive(model_archive):
             config = Params.from_file(os.path.join(tmp, 'config.json'))
     return config
 
-
+#NOTE: Recursively traverse dictionary to find the value corresponding to a key
 def _find_key(d, key):
     val = None
     stack = [d.items()]
@@ -47,9 +47,11 @@ class KnowBertBatchifier:
                        wordnet_entity_file=None, vocab_dir=None):
 
         # get bert_tokenizer_and_candidate_generator
+        #NOTE: contains dict of param 
         config = _extract_config_from_archive(cached_path(model_archive))
 
         # look for the bert_tokenizers and candidate_generator
+        #NOTE: Contains config info for tokenizer and candidate_generator
         candidate_generator_params = _find_key(
             config['dataset_reader'].as_dict(), 'tokenizer_and_candidate_generator'
         )
