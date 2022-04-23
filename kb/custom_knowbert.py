@@ -13,6 +13,8 @@ from allennlp.modules.token_embedders import Embedding
 from allennlp.nn.util import device_mapping
 from allennlp.common.file_utils import cached_path
 
+import torch.nn as nn
+
 
 from pytorch_pretrained_bert.modeling import BertForPreTraining, BertLayer, BertLayerNorm, BertConfig, BertEncoder
 
@@ -66,10 +68,11 @@ def diagnose_forward_hook(module, m_input, m_output):
     print("=======")
 
 
-class BertPretrainedMetricsLoss(Model):
+class CustomBertPretrainedMetricsLoss(nn.Module):
     def __init__(self, vocab: Vocabulary,
                        regularizer: RegularizerApplicator = None):
-        super().__init__(vocab, regularizer)
+        #super().__init__(vocab, regularizer)
+        super().__init__()
 
         self.nsp_loss_function = torch.nn.CrossEntropyLoss(ignore_index=-1)
         self.lm_loss_function = torch.nn.CrossEntropyLoss(ignore_index=0)
@@ -150,7 +153,7 @@ class BertPretrainedMetricsLoss(Model):
 
 
 #@Model.register("bert_pretrained_masked_lm")
-class BertPretrainedMaskedLM(BertPretrainedMetricsLoss):
+class CustomBertPretrainedMaskedLM(CustomBertPretrainedMetricsLoss):
     """
     So we can evaluate and compute the loss of the pretrained bert model
     """
@@ -340,7 +343,6 @@ class DotAttentionWithPrior(torch.nn.Module):
 
         return weighted_entity_embeddings
 
-
 #@BaseEntityDisambiguator.register("diambiguator")
 class EntityDisambiguator(BaseEntityDisambiguator, torch.nn.Module):
     def __init__(self,
@@ -526,8 +528,6 @@ class EntityDisambiguator(BaseEntityDisambiguator, torch.nn.Module):
 
         return return_dict
 
-
-
 #@Model.register("entity_linking_with_candidate_mentions")
 class EntityLinkingWithCandidateMentions(EntityLinkingBase):
     def __init__(self,
@@ -638,9 +638,8 @@ class EntityLinkingWithCandidateMentions(EntityLinkingBase):
 
         return return_dict
 
-
 #@Model.register("soldered_kg")
-class SolderedKG(Model):
+class CustomSolderedKG(Model):
     def __init__(self,
                  vocab: Vocabulary,
                  entity_linker: Model,
@@ -772,9 +771,8 @@ class SolderedKG(Model):
 
         return return_dict
 
-
 #@Model.register("knowbert")
-class KnowBert(BertPretrainedMetricsLoss):
+class CustomKnowBert(CustomBertPretrainedMetricsLoss):
     def __init__(self,
                  vocab: Vocabulary,
                  soldered_kgs: Dict[str, Model],
@@ -788,18 +786,6 @@ class KnowBert(BertPretrainedMetricsLoss):
                  regularizer: RegularizerApplicator = None):
 
         super().__init__(vocab, regularizer)
-
-        # print(f"Vocab: {type(vocab)}")
-        # soldered_kg = soldered_kgs['wordnet']
-        # print(f"Soldered kg: {soldered_kgs}")
-        # print(f"Soldered layers: {soldered_layers}")
-        # print(f"bert model name {bert_model_name}")
-        # print(f"mode {mode}")
-        # print(f"model archive {model_archive}")
-        # print(f"strict_load_archive {strict_load_archive}")
-        # print(f"Debug cuda {debug_cuda}")
-        # print(f"remap_segment_embeddings {remap_segment_embeddings}")
-        # print(f"regularizer {regularizer}")
 
         self.remap_segment_embeddings = remap_segment_embeddings
 
@@ -855,7 +841,6 @@ class KnowBert(BertPretrainedMetricsLoss):
         new_embeddings.weight.data.copy_(token_type_embeddings.data[0, :])
         return new_embeddings
 
-
     def load_state_dict(self, state_dict, strict=True):
         if self.remap_segment_embeddings:
             # hack the embeddings!
@@ -889,7 +874,6 @@ class KnowBert(BertPretrainedMetricsLoss):
 
         return metrics
 
-
     def forward(self, tokens=None, segment_ids=None, candidates=None,
                 lm_label_ids=None, next_sentence_label=None, **kwargs):
 
@@ -905,7 +889,6 @@ class KnowBert(BertPretrainedMetricsLoss):
 
         gold_entities = kwargs.pop('gold_entities', None)
 
-
         for layer_num, soldered_kg_key in self.layer_to_soldered_kg:
             end_layer_index = layer_num + 1
             if end_layer_index > start_layer_index:
@@ -918,6 +901,7 @@ class KnowBert(BertPretrainedMetricsLoss):
             # run the SolderedKG component
             if soldered_kg_key is not None:
                 soldered_kg = getattr(self, soldered_kg_key + "_soldered_kg")
+                #Gives for this soldered kg, the span, prior, ids and the segment_ids of the detected entities
                 soldered_kwargs = candidates[soldered_kg_key]
                 soldered_kwargs.update(kwargs)
                 if gold_entities is not None and soldered_kg_key in gold_entities:
@@ -927,6 +911,7 @@ class KnowBert(BertPretrainedMetricsLoss):
                         tokens_mask=mask,
                         **soldered_kwargs)
 
+                #Add the soldered KG loss
                 if 'loss' in kg_output:
                     loss = loss + kg_output['loss']
 
