@@ -341,7 +341,7 @@ class DotAttentionWithPrior(torch.nn.Module):
         return weighted_entity_embeddings
 
 
-#@BaseEntityDisambiguator.register("diambiguator")
+# @BaseEntityDisambiguator.register("diambiguator")
 class EntityDisambiguator(BaseEntityDisambiguator, torch.nn.Module):
     def __init__(self,
                  contextual_embedding_dim,
@@ -528,7 +528,7 @@ class EntityDisambiguator(BaseEntityDisambiguator, torch.nn.Module):
 
 
 
-#@Model.register("entity_linking_with_candidate_mentions")
+# @Model.register("entity_linking_with_candidate_mentions")
 class EntityLinkingWithCandidateMentions(EntityLinkingBase):
     def __init__(self,
                  vocab: Vocabulary,
@@ -599,7 +599,6 @@ class EntityLinkingWithCandidateMentions(EntityLinkingBase):
         metrics = super().get_metrics(reset)
         return metrics
 
-
     def unfreeze(self, mode):
         # don't hold an parameters directly, so do nothing
         self.disambiguator.unfreeze(mode)
@@ -639,7 +638,7 @@ class EntityLinkingWithCandidateMentions(EntityLinkingBase):
         return return_dict
 
 
-#@Model.register("soldered_kg")
+# @Model.register("soldered_kg")
 class SolderedKG(Model):
     def __init__(self,
                  vocab: Vocabulary,
@@ -773,7 +772,7 @@ class SolderedKG(Model):
         return return_dict
 
 
-#@Model.register("knowbert")
+# @Model.register("knowbert")
 class KnowBert(BertPretrainedMetricsLoss):
     def __init__(self,
                  vocab: Vocabulary,

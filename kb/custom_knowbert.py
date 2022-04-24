@@ -786,6 +786,7 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
                  regularizer: RegularizerApplicator = None):
 
         super().__init__(vocab, regularizer)
+        #NOTE: do not care about vocab
 
         self.remap_segment_embeddings = remap_segment_embeddings
 
@@ -795,20 +796,26 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
         self.pretraining_heads = pretrained_bert.cls
         self.pooler = pretrained_bert.bert.pooler
 
-        # the soldered kgs
+        #NOTE: add the soldered layers as layer of this module
         self.soldered_kgs = soldered_kgs
         for key, skg in soldered_kgs.items():
             self.add_module(key + "_soldered_kg", skg)
 
         # list of (layer_number, soldered key) sorted in ascending order
+        #eg: [(9, 'wordnet')]
         self.layer_to_soldered_kg = sorted(
                 [(layer, key) for key, layer in soldered_layers.items()]
         )
+
         # the last layer
+        # eg: 12
         num_bert_layers = len(self.pretrained_bert.bert.encoder.layer)
+
         # the first element of the list is the index
+        #eg:[(9, 'wordnet'), [11, None]]
         self.layer_to_soldered_kg.append([num_bert_layers - 1, None])
 
+        #Load the model's weights
         if model_archive is not None:
             with tarfile.open(cached_path(model_archive), 'r:gz') as fin:
                 # a file object
@@ -816,6 +823,8 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
                 state_dict = torch.load(weights_file, map_location=device_mapping(-1))
             self.load_state_dict(state_dict, strict=strict_load_archive)
 
+        #Token type embeddigns in bert <=> segment embeddings => originally: to which out of 2 sentence the token belongs to
+        #Remapping allows to have more than 2 segment embeddings type
         if remap_segment_embeddings is not None:
             # will redefine the segment embeddings
             new_embeddings = self._remap_embeddings(self.pretrained_bert.bert.embeddings.token_type_embeddings.weight)
@@ -823,8 +832,10 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
                 del self.pretrained_bert.bert.embeddings.token_type_embeddings
                 self.pretrained_bert.bert.embeddings.token_type_embeddings = new_embeddings
 
+        #entity_linking mode indicates that we are only training the entity linker and freezing the other parameters
         assert mode in (None, 'entity_linking')
         self.mode = mode
+        #if mode = entity_linking,freeze all and then only unfreeze the SolderedKB layer, else, unfreeze the entire model
         self.unfreeze()
 
         if debug_cuda:
@@ -863,6 +874,7 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
             module = getattr(self, key + "_soldered_kg")
             module.unfreeze(self.mode)
 
+    #NOTE: return for each soldered_kg, the loss it can compute??
     def get_metrics(self, reset: bool = False):
         metrics = super().get_metrics(reset)
 
@@ -877,22 +889,56 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
     def forward(self, tokens=None, segment_ids=None, candidates=None,
                 lm_label_ids=None, next_sentence_label=None, **kwargs):
 
+        #Receives: 
+        #tokens['tokens']: Tensor of tokens indices (used to idx an embedding) => because a batch contains multiple
+         #sentences with varying # of tokens, all tokens tensors are padded with zeros 
+         #shape: (batch_size (#sentences), max_seq_len)
+
+        #segment_ids: Tenso of segments_ids for each token (0 for first segment and 1 for second), can be used for NSP
+         #shape: (batch_size,max_seq_len)
+
+        #candidates, for each SolderedKB contains:
+
+         #candidates['wordnet']['candidate_entity_priors']: hape:(batch_size, max # detected entities, max # KB candidate entities)
+          #Correctness probabilities estimated by the entity extractor (sum to 1 (or 0 if padding) on axis 2)
+          #Adds 0 padding to axis 1 when there is less detected entities in the sentence than in the max sentence
+          #Adds 0 padding to axis 2 when there is less detected KB entities for an entity in the sentence than in the max candidate KB entities entity
+
+         #candidates['wordnet']['ids']: shape: (batch_size, max # detected entities, max # KB candidate entities)
+          #Ids of the KB candidate entities + 0 padding on axis 1 or 2 if necessary
+
+         #candidates['wordnet']['candidate_spans']: shape: (batch_size, max # detected entities, 2)
+          #Spans of which sequence of tokens correspond to an entity in the sentence, eg: [1,2] for Michael Jackson (both bounds are included)
+          #Padding with [-1,-1] when no more detected entities
+
+         #candidates['wordnet']['candidate_segment_ids']: shape: (batch_size, max # detected entities)
+          #For each sentence entity, indicate to which segment ids it corresponds to
+        
+        #lm_label_ids: suppose it is the lables of the masked token?
+
+        #next_sentence_label: suppose it is the labels of the next sentence for NSP
+
         assert candidates.keys() == self.soldered_kgs.keys()
 
+        #Mask correspond to token = -1
         mask = tokens['tokens'] > 0
+        #0 for non masked tokens and -10000.0 for masked tokens
         attention_mask = extend_attention_mask_for_bert(mask, get_dtype_for_module(self))
+
+        #Token embeddings extracted from their indices
         contextual_embeddings = self.pretrained_bert.bert.embeddings(tokens['tokens'], segment_ids)
 
         output = {}
         start_layer_index = 0
         loss = 0.0
 
+        #UNCERTAIN: ids of the correct corresponding entity in text => can be usd to train the entity linker
         gold_entities = kwargs.pop('gold_entities', None)
 
         for layer_num, soldered_kg_key in self.layer_to_soldered_kg:
             end_layer_index = layer_num + 1
             if end_layer_index > start_layer_index:
-                # run bert from start to end layers
+                # run bert layer in between previous and current SolderedKG 
                 for layer in self.pretrained_bert.bert.encoder.layer[
                                 start_layer_index:end_layer_index]:
                     contextual_embeddings = layer(contextual_embeddings, attention_mask)
