@@ -5,8 +5,6 @@ import tarfile
 import re
 
 from allennlp.models import Model
-from allennlp.nn.regularizers import RegularizerApplicator
-from allennlp.data import Vocabulary
 from allennlp.modules.span_extractors import SelfAttentiveSpanExtractor
 from allennlp.training.metrics import Average, CategoricalAccuracy
 from allennlp.modules.token_embedders import Embedding
@@ -22,7 +20,6 @@ import torch
 import numpy as np
 
 from kb.metrics import MeanReciprocalRank
-from kb.entity_linking import BaseEntityDisambiguator, EntityLinkingBase
 from kb.span_attention_layer import SpanAttentionLayer
 from kb.common import get_dtype_for_module, extend_attention_mask_for_bert, init_bert_weights
 from kb.common import EntityEmbedder, F1Metric
@@ -69,9 +66,7 @@ def diagnose_forward_hook(module, m_input, m_output):
 
 
 class CustomBertPretrainedMetricsLoss(nn.Module):
-    def __init__(self, vocab: Vocabulary,
-                       regularizer: RegularizerApplicator = None):
-        #super().__init__(vocab, regularizer)
+    def __init__(self):
         super().__init__()
 
         self.nsp_loss_function = torch.nn.CrossEntropyLoss(ignore_index=-1)
@@ -158,11 +153,9 @@ class CustomBertPretrainedMaskedLM(CustomBertPretrainedMetricsLoss):
     So we can evaluate and compute the loss of the pretrained bert model
     """
     def __init__(self,
-                 vocab: Vocabulary,
                  bert_model_name: str,
-                 remap_segment_embeddings: int = None,
-                 regularizer: RegularizerApplicator = None):
-        super().__init__(vocab, regularizer)
+                 remap_segment_embeddings: int = None):
+        super().__init__()
 
         pretrained_bert = BertForPreTraining.from_pretrained(bert_model_name)
         self.pretraining_heads = pretrained_bert.cls
@@ -221,7 +214,6 @@ class CustomBertPretrainedMaskedLM(CustomBertPretrainedMetricsLoss):
                 'contextual_embeddings': contextual_embeddings,
                 'pooled_output': pooled_output}
 
-
 # KnowBert:
 #   Combines bert with one or more SolderedKG
 #
@@ -232,7 +224,8 @@ class CustomBertPretrainedMaskedLM(CustomBertPretrainedMetricsLoss):
 #   (for bert base with 12 layers).
 #
 
-class DotAttentionWithPrior(torch.nn.Module):
+#Do MLP(prior,span_representation @ entity_embedding) and generates weighted entity embedding from the obtained similarities
+class DotAttentionWithPrior(nn.Module):
     def __init__(self,
                  output_feed_forward_hidden_dim: int = 100,
                  weighted_entity_threshold: float = None,
@@ -248,6 +241,8 @@ class DotAttentionWithPrior(torch.nn.Module):
         init_bert_weights(self.out_layer_2, initializer_range)
 
         self.weighted_entity_threshold = weighted_entity_threshold
+
+        #Used to represent entities with all similarity values under threshold => cannot weighted sum => represent them with null entity
         if null_embedding is not None:
             self.register_buffer('null_embedding', null_embedding)
 
@@ -284,12 +279,14 @@ class DotAttentionWithPrior(torch.nn.Module):
         # the prior needs to be input as float32 due to half not supported on
         # cpu.  so need to cast it here.
         dtype = list(self.parameters())[0].dtype
+
         scores_with_prior = torch.cat(
             [scores.unsqueeze(-1), candidate_entity_prior.unsqueeze(-1).to(dtype)],
             dim=-1
         )
 
         # (batch_size, num_spans, num_candidates)
+        #NOTE: applies MLP
         linking_score = self.out_layer_2(
             torch.nn.functional.relu(self.out_layer_1(scores_with_prior))
         ).squeeze(-1)
@@ -299,7 +296,8 @@ class DotAttentionWithPrior(torch.nn.Module):
 
         linking_scores = linking_score.masked_fill(invalid_candidate_mask, -10000.0)
         return_dict = {'linking_scores': linking_scores}
-
+        
+        #Represent entity by weghted sum of entity embeddings
         weighted_entity_embeddings = self._get_weighted_entity_embeddings(
                 linking_scores, candidate_entity_embeddings
         )
@@ -307,6 +305,7 @@ class DotAttentionWithPrior(torch.nn.Module):
 
         return return_dict
 
+    #Do weighted sum of embeddings
     def _get_weighted_entity_embeddings(self, linking_scores, candidate_entity_embeddings):
         """
         Get the entity linking weighted entity embedding
@@ -346,7 +345,7 @@ class DotAttentionWithPrior(torch.nn.Module):
 #@BaseEntityDisambiguator.register("diambiguator")
 class EntityDisambiguator(torch.nn.Module):
     def __init__(self,
-                 contextual_embedding_dim,
+                 contextual_embedding_dim: int,
                  entity_embedding_dim: int,
                  entity_embeddings: torch.nn.Embedding,
                  max_sequence_length: int = 512,
@@ -355,14 +354,39 @@ class EntityDisambiguator(torch.nn.Module):
                  output_feed_forward_hidden_dim: int = 100,
                  initializer_range: float = 0.02,
                  weighted_entity_threshold: float = None,
-                 null_entity_id: int = None,
-                 include_null_embedding_in_dot_attention: bool = False):
+                 null_entity_id: int = None):
         """
         Idea: Align the bert and KG vector space by learning a mapping between
             them.
         """
+        """
+        Extra added:
+        contextual_embedding_dim: dimension of token embeddding
+        entity_embedding_dim: dimension of entity embeddings
+        entity_embeddings: contains embeddings of entity id to vector
+        max_sequence_length: length of max sequence => unused
+        span_encoder_config: configuraton of span encoder (hidden_size,num_hidden_layers,num_attention_heads,intermediate_size)
+        dropout: dropout probability in training 
+        output_feed_forward_hidden_dim: #hidden dim of 1 hidden layer MLP to compute similarity between mention and KB entity 
+                                        MLP(prior,mention_embedding @ entity_embedding)
+
+        initializer_range: std of normal weight initialization
+        weighted_entity_threshold: similarity threshold (computed using MLP (DotAttentionWithPrior)) 
+                                    under which an entity is not considered for the weighted sum representation of entity
+        null_entity_id: entembedding id of null entity
+        include_null_embedding_in_dot_attention: 
+
+        """
+
+        #Not 0???
+        print(entity_embeddings.entity_embeddings.weight[null_entity_id, :])
+
+        #IMPORTANT: entity embedding is not a nn.Embedding => must change
+        #TODO: see if null entity embedding id is used somewhere, else: just provide null entity embedding
+
         super().__init__()
 
+        #self-attentive span pooling descirbed in paper
         self.span_extractor = SelfAttentiveSpanExtractor(entity_embedding_dim)
         init_bert_weights(self.span_extractor._global_attention._module,
                           initializer_range)
@@ -372,6 +396,7 @@ class EntityDisambiguator(torch.nn.Module):
         self.bert_to_kg_projector = torch.nn.Linear(
                 contextual_embedding_dim, entity_embedding_dim)
         init_bert_weights(self.bert_to_kg_projector, initializer_range)
+
         self.projected_span_layer_norm = BertLayerNorm(entity_embedding_dim, eps=1e-5)
         init_bert_weights(self.projected_span_layer_norm, initializer_range)
 
@@ -382,14 +407,17 @@ class EntityDisambiguator(torch.nn.Module):
         self.entity_embeddings = entity_embeddings
         self.entity_embedding_dim = entity_embedding_dim
 
+        print(self.entity_embeddings)
+
         # layers for the dot product attention
-        if weighted_entity_threshold is not None or include_null_embedding_in_dot_attention:
+        if weighted_entity_threshold is not None: #or include_null_embedding_in_dot_attention: will never be used
             if hasattr(self.entity_embeddings, 'get_null_embedding'):
                 null_embedding = self.entity_embeddings.get_null_embedding()
             else:
                 null_embedding = self.entity_embeddings.weight[null_entity_id, :]
         else:
             null_embedding = None
+
         self.dot_attention_with_prior = DotAttentionWithPrior(
                  output_feed_forward_hidden_dim,
                  weighted_entity_threshold,
@@ -511,12 +539,14 @@ class EntityDisambiguator(torch.nn.Module):
         projected_span_representations = self.projected_span_layer_norm(projected_span_representations.contiguous())
 
         # run the span transformer encoders
+        #Apply transformer on spans
         if self.span_encoder is not None:
             projected_span_representations = self._run_span_encoders(
                 projected_span_representations, span_mask
             )[-1]
 
         entity_mask = candidate_entities > 0
+        #Compute similarity with KB entititeis and do weighted sum
         return_dict = self.dot_attention_with_prior(
                     projected_span_representations,
                     candidate_entity_embeddings,
@@ -528,20 +558,14 @@ class EntityDisambiguator(torch.nn.Module):
 
         return return_dict
 
-
 class CustomEntityLinkingBase(nn.Module):
     def __init__(self,
-                 vocab: Vocabulary,
+                 null_entity_id: int,
                  margin: float = 0.2,
                  decode_threshold: float = 0.0,
-                 loss_type: str = 'margin',
-                 namespace: str = 'entity',
-                 regularizer: RegularizerApplicator = None):
+                 loss_type: str = 'margin'):
 
         super().__init__()
-
-        self.vocab = vocab
-        self.regularizer = regularizer
 
         if loss_type == 'margin':
             self.loss = torch.nn.MarginRankingLoss(margin=margin)
@@ -555,8 +579,7 @@ class CustomEntityLinkingBase(nn.Module):
             raise ValueError("invalid loss type, got {}".format(loss_type))
         self.loss_type = loss_type
 
-        self.null_entity_id = self.vocab.get_token_index('@@NULL@@', namespace)
-        assert self.null_entity_id != self.vocab.get_token_index('@@UNKNOWN@@', namespace)
+        self.null_entity_id = null_entity_id
 
         self._f1_metric = F1Metric()
         self._f1_metric_untyped = F1Metric()
@@ -778,7 +801,7 @@ class CustomEntityLinkingBase(nn.Module):
 #Does equation 1,2,3,4,5
 class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
     def __init__(self,
-                 vocab: Vocabulary,
+                 null_entity_id: int,
                  kg_model: Model = None,
                  entity_embedding: Embedding = None,
                  concat_entity_embedder: EntityEmbedder = None,
@@ -790,18 +813,13 @@ class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
                  max_sequence_length: int = 512,
                  dropout: float = 0.1,
                  output_feed_forward_hidden_dim: int = 100,
-                 initializer_range: float = 0.02,
-                 include_null_embedding_in_dot_attention: bool = False,
-                 namespace: str = 'entity',
-                 regularizer: RegularizerApplicator = None):
+                 initializer_range: float = 0.02):
         
         #NOTE: see where it depends on entity EntityLinkingBase and remove not needed functions
-        super().__init__(vocab,
+        super().__init__(null_entity_id=null_entity_id,
                          margin=margin,
                          decode_threshold=decode_threshold,
-                         loss_type=loss_type,
-                         namespace=namespace,
-                         regularizer=regularizer)
+                         loss_type=loss_type)
         
         #NOTE: all subsequent lines are used to extract entity embedding => can replace them by just entity embedding from nn.Embedding
         #NOTE: this model holds no parameter: all the work is done by EntityDisambiguator => can remove this class
@@ -829,10 +847,6 @@ class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
             weighted_entity_threshold = decode_threshold
         else:
             weighted_entity_threshold = None
-        
-        #NOTE: Only use of vocab is to get null_entity_id??
-        null_entity_id = vocab.get_token_index('@@NULL@@', namespace)
-        assert null_entity_id != vocab.get_token_index('@@UNKNOWN@@', namespace)
 
         self.disambiguator = EntityDisambiguator(
                  contextual_embedding_dim,
@@ -844,7 +858,6 @@ class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
                  output_feed_forward_hidden_dim=output_feed_forward_hidden_dim,
                  initializer_range=initializer_range,
                  weighted_entity_threshold=weighted_entity_threshold,
-                 include_null_embedding_in_dot_attention=include_null_embedding_in_dot_attention,
                  null_entity_id=null_entity_id)
 
 
@@ -893,15 +906,12 @@ class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
 #@Model.register("soldered_kg")
 class CustomSolderedKG(nn.Module):
     def __init__(self,
-                 vocab: Vocabulary,
                  entity_linker: Model,
                  span_attention_config: Dict[str, int], 
                  should_init_kg_to_bert_inverse: bool = True,
-                 freeze: bool = False,
-                 regularizer: RegularizerApplicator = None):
+                 freeze: bool = False):
 
         #Do not care about vocab     
-        #super().__init__(vocab, regularizer)
         super().__init__()
 
         #span_attention_config is used to create SpanAttentionLayer
@@ -1036,9 +1046,9 @@ class CustomSolderedKG(nn.Module):
         return return_dict
 
 #@Model.register("knowbert")
+#Removed vocab
 class CustomKnowBert(CustomBertPretrainedMetricsLoss):
     def __init__(self,
-                 vocab: Vocabulary,
                  soldered_kgs: Dict[str, Model],
                  soldered_layers: Dict[str, int],
                  bert_model_name: str,
@@ -1046,11 +1056,9 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
                  model_archive: str = None,
                  strict_load_archive: bool = True,
                  debug_cuda: bool = False,
-                 remap_segment_embeddings: int = None,
-                 regularizer: RegularizerApplicator = None):
+                 remap_segment_embeddings: int = None):
 
-        super().__init__(vocab, regularizer)
-        #NOTE: do not care about vocab
+        super().__init__()
 
         self.remap_segment_embeddings = remap_segment_embeddings
 

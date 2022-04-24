@@ -149,7 +149,7 @@ class BertPretrainedMetricsLoss(Model):
         self._metrics['mrr'](prediction_scores, lm_labels_ids, mask_indicator)
 
 
-#@Model.register("bert_pretrained_masked_lm")
+@Model.register("bert_pretrained_masked_lm")
 class BertPretrainedMaskedLM(BertPretrainedMetricsLoss):
     """
     So we can evaluate and compute the loss of the pretrained bert model
@@ -340,8 +340,7 @@ class DotAttentionWithPrior(torch.nn.Module):
 
         return weighted_entity_embeddings
 
-
-# @BaseEntityDisambiguator.register("diambiguator")
+@BaseEntityDisambiguator.register("diambiguator")
 class EntityDisambiguator(BaseEntityDisambiguator, torch.nn.Module):
     def __init__(self,
                  contextual_embedding_dim,
@@ -526,9 +525,7 @@ class EntityDisambiguator(BaseEntityDisambiguator, torch.nn.Module):
 
         return return_dict
 
-
-
-# @Model.register("entity_linking_with_candidate_mentions")
+@Model.register("entity_linking_with_candidate_mentions")
 class EntityLinkingWithCandidateMentions(EntityLinkingBase):
     def __init__(self,
                  vocab: Vocabulary,
@@ -638,7 +635,7 @@ class EntityLinkingWithCandidateMentions(EntityLinkingBase):
         return return_dict
 
 
-# @Model.register("soldered_kg")
+@Model.register("soldered_kg")
 class SolderedKG(Model):
     def __init__(self,
                  vocab: Vocabulary,
@@ -772,7 +769,7 @@ class SolderedKG(Model):
         return return_dict
 
 
-# @Model.register("knowbert")
+@Model.register("knowbert")
 class KnowBert(BertPretrainedMetricsLoss):
     def __init__(self,
                  vocab: Vocabulary,
