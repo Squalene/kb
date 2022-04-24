@@ -639,7 +639,7 @@ class EntityLinkingWithCandidateMentions(EntityLinkingBase):
         return return_dict
 
 #@Model.register("soldered_kg")
-class CustomSolderedKG(Model):
+class CustomSolderedKG(nn.Module):
     def __init__(self,
                  vocab: Vocabulary,
                  entity_linker: Model,
@@ -647,10 +647,16 @@ class CustomSolderedKG(Model):
                  should_init_kg_to_bert_inverse: bool = True,
                  freeze: bool = False,
                  regularizer: RegularizerApplicator = None):
-        super().__init__(vocab, regularizer)
 
+        #Do not care about vocab     
+        #super().__init__(vocab, regularizer)
+        super().__init__()
+        
+        #EntityLinkingWithCandidateMentions
         self.entity_linker = entity_linker
+        #200
         self.entity_embedding_dim = self.entity_linker.disambiguator.entity_embedding_dim
+        #768
         self.contextual_embedding_dim = self.entity_linker.disambiguator.contextual_embedding_dim
 
         self.weighted_entity_layer_norm = BertLayerNorm(self.entity_embedding_dim, eps=1e-5)
@@ -673,11 +679,14 @@ class CustomSolderedKG(Model):
         # for the output!
         self.output_layer_norm = BertLayerNorm(self.contextual_embedding_dim, eps=1e-5)
 
+        #Project back from kg embedding to bert embeddding
         self.kg_to_bert_projection = torch.nn.Linear(
                 self.entity_embedding_dim, self.contextual_embedding_dim
         )
 
         self.should_init_kg_to_bert_inverse = should_init_kg_to_bert_inverse
+        #Project back from kg embedding to bert embeddding is initialized with 
+        # inverse of projection from bert embeddding to kg embedding
         self._init_kg_to_bert_projection()
 
         self._freeze_all = freeze
@@ -738,14 +747,14 @@ class CustomSolderedKG(Model):
         # update the span representations with the entity embeddings
         span_representations = linker_output['projected_span_representations']
         weighted_entity_embeddings = linker_output['weighted_entity_embeddings']
+        #Sum of entity span reprensentations and weighted entity embeddings (equation 6)
         spans_with_entities = self.weighted_entity_layer_norm(
                 (span_representations +
                 self.dropout(weighted_entity_embeddings)).contiguous()
         )
 
-        # now run self attention between bert and spans_with_entities
-        # to update bert.
-        # this is done in projected dimension
+        # self attention between bert and spans_with_entities (done in projected dimension )
+        # span_attention_output = MLP(MultiHeadAttn(H_i^proj,S'e,S'e))
         entity_mask = candidate_spans[:, :, 0] > -1
         span_attention_output = self.span_attention_layer(
                 linker_output['projected_bert_representations'],
@@ -755,10 +764,11 @@ class CustomSolderedKG(Model):
         projected_bert_representations_with_entities = span_attention_output['output']
         entity_attention_probs = span_attention_output["attention_probs"]
 
-        # finally project back to full bert dimension!
+        # Project back to full bert dimension 
         bert_representations_with_entities = self.kg_to_bert_projection(
                 projected_bert_representations_with_entities
         )
+        #Equation 7 of paper
         new_contextual_embeddings = self.output_layer_norm(
                 (contextual_embeddings + self.dropout(bert_representations_with_entities)).contiguous()
         )
@@ -932,7 +942,7 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
         start_layer_index = 0
         loss = 0.0
 
-        #UNCERTAIN: ids of the correct corresponding entity in text => can be usd to train the entity linker
+        #UNCERTAIN: dictionnary that for each soldered kg layer contains a list of the ids of the correct entity in text => can be usd to train the entity linker
         gold_entities = kwargs.pop('gold_entities', None)
 
         for layer_num, soldered_kg_key in self.layer_to_soldered_kg:
@@ -946,6 +956,7 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
 
             # run the SolderedKG component
             if soldered_kg_key is not None:
+                #Get soldered_kg module
                 soldered_kg = getattr(self, soldered_kg_key + "_soldered_kg")
                 #Gives for this soldered kg, the span, prior, ids and the segment_ids of the detected entities
                 soldered_kwargs = candidates[soldered_kg_key]
@@ -957,11 +968,13 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
                         tokens_mask=mask,
                         **soldered_kwargs)
 
-                #Add the soldered KG loss
+                #Add the soldered KG loss (entity linker loss) to the sum of loss of other soldered KG
                 if 'loss' in kg_output:
                     loss = loss + kg_output['loss']
 
                 contextual_embeddings = kg_output['contextual_embeddings']
+
+                #Add the output of the soldered kg to the output of KnowBert
                 output[soldered_kg_key] = {}
                 for key in kg_output.keys():
                     if key != 'loss' and key != 'contextual_embeddings':
@@ -971,7 +984,7 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
         pooled_output = self.pooler(contextual_embeddings)
 
         if lm_label_ids is not None or next_sentence_label is not None:
-            # compute loss !
+            # compute MLM and NSP loss
             masked_lm_loss, next_sentence_loss = self._compute_loss(
                     contextual_embeddings,
                     pooled_output,
