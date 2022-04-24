@@ -25,7 +25,7 @@ from kb.metrics import MeanReciprocalRank
 from kb.entity_linking import BaseEntityDisambiguator, EntityLinkingBase
 from kb.span_attention_layer import SpanAttentionLayer
 from kb.common import get_dtype_for_module, extend_attention_mask_for_bert, init_bert_weights
-from kb.common import EntityEmbedder, set_requires_grad
+from kb.common import EntityEmbedder, F1Metric
 from kb.evaluation.exponential_average_metric import ExponentialMovingAverage
 from kb.evaluation.weighted_average import WeightedAverage
 
@@ -344,7 +344,7 @@ class DotAttentionWithPrior(torch.nn.Module):
         return weighted_entity_embeddings
 
 #@BaseEntityDisambiguator.register("diambiguator")
-class EntityDisambiguator(BaseEntityDisambiguator, torch.nn.Module):
+class EntityDisambiguator(torch.nn.Module):
     def __init__(self,
                  contextual_embedding_dim,
                  entity_embedding_dim: int,
@@ -528,8 +528,255 @@ class EntityDisambiguator(BaseEntityDisambiguator, torch.nn.Module):
 
         return return_dict
 
+
+class CustomEntityLinkingBase(nn.Module):
+    def __init__(self,
+                 vocab: Vocabulary,
+                 margin: float = 0.2,
+                 decode_threshold: float = 0.0,
+                 loss_type: str = 'margin',
+                 namespace: str = 'entity',
+                 regularizer: RegularizerApplicator = None):
+
+        super().__init__()
+
+        self.vocab = vocab
+        self.regularizer = regularizer
+
+        if loss_type == 'margin':
+            self.loss = torch.nn.MarginRankingLoss(margin=margin)
+            self.decode_threshold = decode_threshold
+        elif loss_type == 'softmax':
+            self.loss = torch.nn.NLLLoss(ignore_index=-100)
+            # set threshold to small value so we just take argmax
+            self._log_softmax = torch.nn.LogSoftmax(dim=-1)
+            self.decode_threshold = -990
+        else:
+            raise ValueError("invalid loss type, got {}".format(loss_type))
+        self.loss_type = loss_type
+
+        self.null_entity_id = self.vocab.get_token_index('@@NULL@@', namespace)
+        assert self.null_entity_id != self.vocab.get_token_index('@@UNKNOWN@@', namespace)
+
+        self._f1_metric = F1Metric()
+        self._f1_metric_untyped = F1Metric()
+
+    def _compute_f1(self, linking_scores, candidate_spans, candidate_entities,
+                          gold_entities):
+        # will call F1Metric with predicted and gold entities encoded as
+        # [(start, end), entity_id]
+
+        predicted_entities = self._decode(
+                    linking_scores, candidate_spans, candidate_entities
+        )
+
+        # make a mask of valid predictions and non-null entities to select
+        # ids and spans
+        # (batch_size, num_spans, 1)
+        gold_mask = (gold_entities > 0) & (gold_entities != self.null_entity_id)
+
+        valid_gold_entity_spans = candidate_spans[
+                torch.cat([gold_mask, gold_mask], dim=-1)
+        ].view(-1, 2).tolist()
+        valid_gold_entity_id = gold_entities[gold_mask].tolist()
+
+        batch_size, num_spans, _ = linking_scores.shape
+        batch_indices = torch.arange(batch_size).unsqueeze(-1).repeat([1, num_spans])[gold_mask.squeeze(-1).cpu()]
+
+        gold_entities_for_f1 = []
+        predicted_entities_for_f1 = []
+        gold_spans_for_f1 = []
+        predicted_spans_for_f1 = []
+        for k in range(batch_size):
+            gold_entities_for_f1.append([])
+            predicted_entities_for_f1.append([])
+            gold_spans_for_f1.append([])
+            predicted_spans_for_f1.append([])
+
+        for gi, gs, g_batch_index in zip(valid_gold_entity_id,
+                              valid_gold_entity_spans,
+                              batch_indices.tolist()):
+            gold_entities_for_f1[g_batch_index].append((tuple(gs), gi))
+            gold_spans_for_f1[g_batch_index].append((tuple(gs), "ENT"))
+
+        for p_batch_index, ps, pi in predicted_entities:
+            span = tuple(ps)
+            predicted_entities_for_f1[p_batch_index].append((span, pi))
+            predicted_spans_for_f1[p_batch_index].append((span, "ENT"))
+
+        self._f1_metric_untyped(predicted_spans_for_f1, gold_spans_for_f1)
+        self._f1_metric(predicted_entities_for_f1, gold_entities_for_f1)
+
+    def _decode(self, linking_scores, candidate_spans, candidate_entities):
+        # returns [[batch_index1, (start1, end1), eid1],
+        #          [batch_index2, (start2, end2), eid2], ...]
+
+        # Note: We assume that linking_scores has already had the mask
+        # applied such that invalid candidates have very low score. As a result,
+        # we don't need to worry about masking the valid candidate spans
+        # here, since their score will be very low, and won't exceed
+        # the threshold.
+
+        # find maximum candidate entity score in each valid span
+        # (batch_size, num_spans), (batch_size, num_spans)
+        max_candidate_score, max_candidate_indices = linking_scores.max(dim=-1)
+
+        # get those above the threshold
+        above_threshold_mask = max_candidate_score > self.decode_threshold
+
+        # for entities with score > threshold:
+        #       get original candidate span
+        #       get original entity id
+        # (num_extracted_spans, 2)
+        extracted_candidates = candidate_spans[above_threshold_mask]
+        # (num_extracted_spans, num_candidates)
+        candidate_entities_for_extracted_spans = candidate_entities[above_threshold_mask]
+        extracted_indices = max_candidate_indices[above_threshold_mask]
+        # the batch number (num_extracted_spans, )
+        batch_size, num_spans, _ = linking_scores.shape
+        batch_indices = torch.arange(batch_size).unsqueeze(-1).repeat([1, num_spans])[above_threshold_mask.cpu()]
+
+        extracted_entity_ids = []
+        for k, ind in enumerate(extracted_indices):
+            extracted_entity_ids.append(candidate_entities_for_extracted_spans[k, ind])
+
+        # make tuples [(span start, span end), id], ignoring the null entity
+        ret = []
+        for start_end, eid, batch_index in zip(
+                    extracted_candidates.tolist(),
+                    extracted_entity_ids,
+                    batch_indices.tolist()
+        ):
+            entity_id = eid.item()
+            if entity_id != self.null_entity_id:
+                ret.append((batch_index, tuple(start_end), entity_id))
+
+        return ret
+
+    def get_metrics(self, reset: bool = False):
+        precision, recall, f1_measure = self._f1_metric.get_metric(reset)
+        precision_span, recall_span, f1_measure_span = self._f1_metric_untyped.get_metric(reset)
+        metrics = {
+            'el_precision': precision,
+            'el_recall': recall,
+            'el_f1': f1_measure,
+            'span_precision': precision_span,
+            'span_recall': recall_span,
+            'span_f1': f1_measure_span
+        }
+
+        return metrics
+
+    def _compute_loss(self,
+                      candidate_entities,
+                      candidate_spans,
+                      linking_scores,
+                      gold_entities):
+
+        if self.loss_type == 'margin':
+            return self._compute_margin_loss(
+                    candidate_entities, candidate_spans, linking_scores, gold_entities
+            )
+        elif self.loss_type == 'softmax':
+            return self._compute_softmax_loss(
+                    candidate_entities, candidate_spans, linking_scores, gold_entities
+            )
+
+    def _compute_margin_loss(self,
+                             candidate_entities,
+                             candidate_spans,
+                             linking_scores,
+                             gold_entities):
+
+        # compute loss
+        # in End-to-End Neural Entity Linking
+        # loss = max(0, gamma - score) if gold mention
+        # loss = max(0, score) if not gold mention
+        #
+        # torch.nn.MaxMarginLoss(x1, x2, y) = max(0, -y * (x1 - x2) + gamma)
+        #   = max(0, -x1 + x2 + gamma)  y = +1
+        #   = max(0, gamma - x1) if x2 == 0, y=+1
+        #
+        #   = max(0, x1 - gamma) if y==-1, x2=0
+
+        candidate_mask = candidate_entities > 0
+        # (num_entities, )
+        non_masked_scores = linking_scores[candidate_mask]
+
+        # broadcast gold ids to all candidates
+        num_candidates = candidate_mask.shape[-1]
+        # (batch_size, num_spans, num_candidates)
+        broadcast_gold_entities = gold_entities.repeat(
+                    1, 1, num_candidates
+        )
+        # compute +1 / -1 labels for whether each candidate is gold
+        positive_labels = (broadcast_gold_entities == candidate_entities).long()
+        negative_labels = (broadcast_gold_entities != candidate_entities).long()
+        labels = (positive_labels - negative_labels).to(dtype=get_dtype_for_module(self))
+        # finally select the non-masked candidates
+        # (num_entities, ) with +1 / -1
+        non_masked_labels = labels[candidate_mask]
+
+        loss = self.loss(
+                non_masked_scores, torch.zeros_like(non_masked_labels),
+                non_masked_labels
+        )
+
+        # metrics
+        self._compute_f1(linking_scores, candidate_spans,
+                         candidate_entities,
+                         gold_entities)
+
+        return {'loss': loss}
+
+    def _compute_softmax_loss(self, 
+                             candidate_entities, 
+                             candidate_spans,
+                             linking_scores, 
+                             gold_entities):
+
+        # compute log softmax
+        # linking scores is already masked with -1000 in invalid locations
+        # (batch_size, num_spans, max_num_candidates)
+        log_prob = self._log_softmax(linking_scores)
+
+        # get the valid scores.
+        # needs to be index into the last time of log_prob, with -100
+        # for missing values
+        num_candidates = log_prob.shape[-1]
+        # (batch_size, num_spans, num_candidates)
+        broadcast_gold_entities = gold_entities.repeat(
+                    1, 1, num_candidates
+        )
+
+        # location of the positive label
+        positive_labels = (broadcast_gold_entities == candidate_entities).long()
+        # index of the positive class
+        targets = positive_labels.argmax(dim=-1)
+
+        # fill in the ignore class
+        # DANGER: we assume that each instance has exactly one gold
+        # label, and that padded instances are ones for which all
+        # candidates are invalid
+        # (batch_size, num_spans)
+        invalid_prediction_mask = (
+            candidate_entities != 0
+        ).long().sum(dim=-1) == 0
+        targets[invalid_prediction_mask] = -100
+
+        loss = self.loss(log_prob.view(-1, num_candidates), targets.view(-1, ))
+
+        # metrics
+        self._compute_f1(linking_scores, candidate_spans,
+                         candidate_entities,
+                         gold_entities)
+
+        return {'loss': loss}
+
 #@Model.register("entity_linking_with_candidate_mentions")
-class EntityLinkingWithCandidateMentions(EntityLinkingBase):
+#NOTE: previously inherited from EntityLinkingBase
+#Does equation 1,2,3,4,5
+class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
     def __init__(self,
                  vocab: Vocabulary,
                  kg_model: Model = None,
@@ -547,14 +794,17 @@ class EntityLinkingWithCandidateMentions(EntityLinkingBase):
                  include_null_embedding_in_dot_attention: bool = False,
                  namespace: str = 'entity',
                  regularizer: RegularizerApplicator = None):
-
+        
+        #NOTE: see where it depends on entity EntityLinkingBase and remove not needed functions
         super().__init__(vocab,
                          margin=margin,
                          decode_threshold=decode_threshold,
                          loss_type=loss_type,
                          namespace=namespace,
                          regularizer=regularizer)
-
+        
+        #NOTE: all subsequent lines are used to extract entity embedding => can replace them by just entity embedding from nn.Embedding
+        #NOTE: this model holds no parameter: all the work is done by EntityDisambiguator => can remove this class
         num_embeddings_passed = sum(
             [kg_model is not None, entity_embedding is not None, concat_entity_embedder is not None]
         )
@@ -563,23 +813,26 @@ class EntityLinkingWithCandidateMentions(EntityLinkingBase):
 
         elif kg_model is not None:
             entity_embedding = kg_model.get_entity_embedding()
-            entity_embedding_dim  = entity_embedding.embedding_dim
+            entity_embedding_dim = entity_embedding.embedding_dim
 
         elif entity_embedding is not None:
             entity_embedding_dim  = entity_embedding.get_output_dim()
 
         elif concat_entity_embedder is not None:
-            entity_embedding_dim  = concat_entity_embedder.get_output_dim()
-            set_requires_grad(concat_entity_embedder, False)
+            entity_embedding_dim = concat_entity_embedder.get_output_dim()
+            for param in concat_entity_embedder.parameters():
+                param.requires_grad_(False)
+
             entity_embedding = concat_entity_embedder
 
         if loss_type == 'margin':
             weighted_entity_threshold = decode_threshold
         else:
             weighted_entity_threshold = None
-
-        null_entity_id = self.vocab.get_token_index('@@NULL@@', namespace)
-        assert null_entity_id != self.vocab.get_token_index('@@UNKNOWN@@', namespace)
+        
+        #NOTE: Only use of vocab is to get null_entity_id??
+        null_entity_id = vocab.get_token_index('@@NULL@@', namespace)
+        assert null_entity_id != vocab.get_token_index('@@UNKNOWN@@', namespace)
 
         self.disambiguator = EntityDisambiguator(
                  contextual_embedding_dim,
@@ -598,7 +851,6 @@ class EntityLinkingWithCandidateMentions(EntityLinkingBase):
     def get_metrics(self, reset: bool = False):
         metrics = super().get_metrics(reset)
         return metrics
-
 
     def unfreeze(self, mode):
         # don't hold an parameters directly, so do nothing
@@ -643,7 +895,7 @@ class CustomSolderedKG(nn.Module):
     def __init__(self,
                  vocab: Vocabulary,
                  entity_linker: Model,
-                 span_attention_config: Dict[str, int],
+                 span_attention_config: Dict[str, int], 
                  should_init_kg_to_bert_inverse: bool = True,
                  freeze: bool = False,
                  regularizer: RegularizerApplicator = None):
@@ -651,6 +903,8 @@ class CustomSolderedKG(nn.Module):
         #Do not care about vocab     
         #super().__init__(vocab, regularizer)
         super().__init__()
+
+        #span_attention_config is used to create SpanAttentionLayer
         
         #EntityLinkingWithCandidateMentions
         self.entity_linker = entity_linker
