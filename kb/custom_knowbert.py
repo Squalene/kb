@@ -2,27 +2,24 @@ from typing import Dict, List
 
 import math
 import tarfile
-import re
 
-from allennlp.models import Model
-from allennlp.modules.span_extractors import SelfAttentiveSpanExtractor
 from allennlp.training.metrics import Average, CategoricalAccuracy
-from allennlp.modules.token_embedders import Embedding
 from allennlp.nn.util import device_mapping
 from allennlp.common.file_utils import cached_path
-
-import torch.nn as nn
-
 
 from pytorch_pretrained_bert.modeling import BertForPreTraining, BertLayer, BertLayerNorm, BertConfig, BertEncoder
 
 import torch
+import torch.nn as nn
 import numpy as np
+import h5py
 
+from kb.custom_span_extractor import SelfAttentiveSpanExtractor
+from kb.common import JsonFile
 from kb.metrics import MeanReciprocalRank
 from kb.span_attention_layer import SpanAttentionLayer
 from kb.common import get_dtype_for_module, extend_attention_mask_for_bert, init_bert_weights
-from kb.common import EntityEmbedder, F1Metric
+from kb.common import F1Metric
 from kb.evaluation.exponential_average_metric import ExponentialMovingAverage
 from kb.evaluation.weighted_average import WeightedAverage
 
@@ -63,6 +60,162 @@ def diagnose_forward_hook(module, m_input, m_output):
     print("OUTPUT:")
     print_shapes(m_output, raise_on_nan=True)
     print("=======")
+
+#Similar to nn.Embedding but allow for more functionalities
+class EntityEmbedder():
+    pass
+
+#Acts like a standard embedding but with pre-trained entity embeddings and trained POS embeddings
+class CustomWordNetAllEmbedding(torch.nn.Module, EntityEmbedder):
+    """
+    Combines pretrained fixed embeddings with learned POS embeddings.
+
+    Given entity candidate list:
+        - get list of unique entity ids
+        - look up
+        - concat POS embedding
+        - linear project to candidate embedding shape
+    """
+    POS_MAP = {
+        '@@PADDING@@': 0,
+        'n': 1,
+        'v': 2,
+        'a': 3,
+        'r': 4,
+        's': 5,
+        # have special POS embeddings for mask / null, so model can learn
+        # it's own representation for them
+        '@@MASK@@': 6,
+        '@@NULL@@': 7,
+        '@@UNKNOWN@@': 8
+    }
+
+    def __init__(self,
+                 embedding_file: str,
+                 entity_dim: int,
+                 entity_file: str = None,
+                 vocab_file: str = None,
+                 entity_h5_key: str = 'conve_tucker_infersent_bert',
+                 dropout: float = 0.1,
+                 pos_embedding_dim: int = 25,
+                 include_null_embedding: bool = False):
+        """
+        pass pos_emedding_dim = None to skip POS embeddings and all the
+            entity stuff, using this as a pretrained embedding file
+            with feedforward
+        """
+
+        super().__init__()
+
+        if pos_embedding_dim is not None:
+            # entity_id -> pos abbreviation, e.g.
+            # 'cat.n.01' -> 'n'
+            # includes special, e.g. '@@PADDING@@' -> '@@PADDING@@'
+            entity_to_pos = {}
+            with JsonFile(cached_path(entity_file), 'r') as fin:
+                for node in fin:
+                    if node['type'] == 'synset':
+                        entity_to_pos[node['id']] = node['pos']
+            for special in ['@@PADDING@@', '@@MASK@@', '@@NULL@@', '@@UNKNOWN@@']:
+                entity_to_pos[special] = special
+    
+            # list of entity ids
+            entities = ['@@PADDING@@']
+            with open(cached_path(vocab_file), 'r') as fin:
+                for line in fin:
+                    entities.append(line.strip())
+    
+            # the map from entity index id -> pos embedding id,
+            # will use for POS embedding lookup
+            entity_id_to_pos_index = [
+                 self.POS_MAP[entity_to_pos[ent]] for ent in entities
+            ]
+            self.register_buffer('entity_id_to_pos_index', torch.tensor(entity_id_to_pos_index))
+    
+            self.pos_embeddings = torch.nn.Embedding(len(entities), pos_embedding_dim)
+            init_bert_weights(self.pos_embeddings, 0.02)
+
+            self.use_pos = True
+        else:
+            self.use_pos = False
+
+        # load the embeddings
+        with h5py.File(cached_path(embedding_file), 'r') as fin:
+            entity_embeddings = fin[entity_h5_key][...]
+        self.entity_embeddings = torch.nn.Embedding(
+                entity_embeddings.shape[0], entity_embeddings.shape[1],
+                padding_idx=0
+        )
+        self.entity_embeddings.weight.data.copy_(torch.tensor(entity_embeddings).contiguous())
+
+        if pos_embedding_dim is not None:
+            assert entity_embeddings.shape[0] == len(entities)
+            concat_dim = entity_embeddings.shape[1] + pos_embedding_dim
+        else:
+            concat_dim = entity_embeddings.shape[1]
+
+        self.proj_feed_forward = torch.nn.Linear(concat_dim, entity_dim)
+        init_bert_weights(self.proj_feed_forward, 0.02)
+
+        self.dropout = torch.nn.Dropout(dropout)
+
+        self.embedding_dim = entity_dim
+
+        self.include_null_embedding = include_null_embedding
+        self.null_embedding=None
+        if include_null_embedding:
+            # a special embedding for null
+            entities = ['@@PADDING@@']
+            with open(cached_path(vocab_file), 'r') as fin:
+                for line in fin:
+                    entities.append(line.strip())
+            self.null_id = entities.index("@@NULL@@")
+            self.null_embedding = torch.nn.Parameter(torch.zeros(entity_dim))
+            self.null_embedding.data.normal_(mean=0.0, std=0.02)
+
+    def get_output_dim(self):
+        return self.embedding_dim
+
+    def get_null_embedding(self):
+        return self.null_embedding
+
+    def forward(self, entity_ids):
+        """
+        entity_ids = (batch_size, num_candidates, num_entities) array of entity
+            ids
+
+        returns (batch_size, num_candidates, num_entities, embed_dim)
+            with entity embeddings
+        """
+        # get list of unique entity ids
+        unique_ids, unique_ids_to_entity_ids = torch.unique(entity_ids, return_inverse=True)
+        # unique_ids[unique_ids_to_entity_ids].reshape(entity_ids.shape)
+
+        # look up (num_unique_embeddings, full_entity_dim)
+        unique_entity_embeddings = self.entity_embeddings(unique_ids.contiguous()).contiguous()
+
+        # get POS tags from entity ids (form entity id -> pos id embedding)
+        # (num_unique_embeddings)
+        if self.use_pos:
+            unique_pos_ids = torch.nn.functional.embedding(unique_ids, self.entity_id_to_pos_index).contiguous()
+            # (num_unique_embeddings, pos_dim)
+            unique_pos_embeddings = self.pos_embeddings(unique_pos_ids).contiguous()
+            # concat
+            entity_and_pos = torch.cat([unique_entity_embeddings, unique_pos_embeddings], dim=-1)
+        else:
+            entity_and_pos = unique_entity_embeddings
+
+        # run the ff
+        # (num_embeddings, entity_dim)
+        projected_entity_and_pos = self.dropout(self.proj_feed_forward(entity_and_pos.contiguous()))
+
+        # replace null if needed
+        if self.include_null_embedding:
+            null_mask = unique_ids == self.null_id
+            projected_entity_and_pos[null_mask] = self.null_embedding
+
+        # remap to candidate embedding shape
+        return projected_entity_and_pos[unique_ids_to_entity_ids].contiguous()
 
 
 class CustomBertPretrainedMetricsLoss(nn.Module):
@@ -347,14 +500,14 @@ class EntityDisambiguator(torch.nn.Module):
     def __init__(self,
                  contextual_embedding_dim: int,
                  entity_embedding_dim: int,
-                 entity_embeddings: torch.nn.Embedding,
+                 entity_embeddings: EntityEmbedder,
                  max_sequence_length: int = 512,
                  span_encoder_config: Dict[str, int] = None,
                  dropout: float = 0.1,
                  output_feed_forward_hidden_dim: int = 100,
                  initializer_range: float = 0.02,
                  weighted_entity_threshold: float = None,
-                 null_entity_id: int = None):
+                 null_embedding: torch.Tensor = None):
         """
         Idea: Align the bert and KG vector space by learning a mapping between
             them.
@@ -373,22 +526,20 @@ class EntityDisambiguator(torch.nn.Module):
         initializer_range: std of normal weight initialization
         weighted_entity_threshold: similarity threshold (computed using MLP (DotAttentionWithPrior)) 
                                     under which an entity is not considered for the weighted sum representation of entity
-        null_entity_id: entembedding id of null entity
-        include_null_embedding_in_dot_attention: 
+        null_embedding: enbedding of null entity
 
         """
 
         #Not 0???
-        print(entity_embeddings.entity_embeddings.weight[null_entity_id, :])
+        #print(entity_embeddings.entity_embeddings.weight[null_entity_id, :])
 
-        #IMPORTANT: entity embedding is not a nn.Embedding => must change
         #TODO: see if null entity embedding id is used somewhere, else: just provide null entity embedding
 
         super().__init__()
 
         #self-attentive span pooling descirbed in paper
         self.span_extractor = SelfAttentiveSpanExtractor(entity_embedding_dim)
-        init_bert_weights(self.span_extractor._global_attention._module,
+        init_bert_weights(self.span_extractor._global_attention,
                           initializer_range)
 
         self.dropout = torch.nn.Dropout(dropout)
@@ -407,24 +558,12 @@ class EntityDisambiguator(torch.nn.Module):
         self.entity_embeddings = entity_embeddings
         self.entity_embedding_dim = entity_embedding_dim
 
-        print(self.entity_embeddings)
-
-        # layers for the dot product attention
-        if weighted_entity_threshold is not None: #or include_null_embedding_in_dot_attention: will never be used
-            if hasattr(self.entity_embeddings, 'get_null_embedding'):
-                null_embedding = self.entity_embeddings.get_null_embedding()
-            else:
-                null_embedding = self.entity_embeddings.weight[null_entity_id, :]
-        else:
-            null_embedding = None
-
         self.dot_attention_with_prior = DotAttentionWithPrior(
                  output_feed_forward_hidden_dim,
                  weighted_entity_threshold,
                  null_embedding,
                  initializer_range
         )
-        self.null_entity_id = null_entity_id
         self.contextual_embedding_dim = contextual_embedding_dim
 
         if span_encoder_config is None:
@@ -802,9 +941,7 @@ class CustomEntityLinkingBase(nn.Module):
 class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
     def __init__(self,
                  null_entity_id: int,
-                 kg_model: Model = None,
-                 entity_embedding: Embedding = None,
-                 concat_entity_embedder: EntityEmbedder = None,
+                 entity_embedding: EntityEmbedder = None,
                  contextual_embedding_dim: int = None,
                  span_encoder_config: Dict[str, int] = None,
                  margin: float = 0.2,
@@ -821,28 +958,19 @@ class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
                          decode_threshold=decode_threshold,
                          loss_type=loss_type)
         
-        #NOTE: all subsequent lines are used to extract entity embedding => can replace them by just entity embedding from nn.Embedding
-        #NOTE: this model holds no parameter: all the work is done by EntityDisambiguator => can remove this class
-        num_embeddings_passed = sum(
-            [kg_model is not None, entity_embedding is not None, concat_entity_embedder is not None]
-        )
-        if num_embeddings_passed != 1:
-            raise ValueError("Linking model needs either a kg factorisation model or an entity embedding.")
+        if hasattr(entity_embedding, 'get_null_embedding'):
+            null_embedding = entity_embedding.get_null_embedding()
+        else:
+            null_embedding = entity_embedding.weight[null_entity_id, :]
 
-        elif kg_model is not None:
-            entity_embedding = kg_model.get_entity_embedding()
-            entity_embedding_dim = entity_embedding.embedding_dim
+        #NOTE: this model holds no parameter: all the work is done by EntityDisambiguator => can remove this class??
 
-        elif entity_embedding is not None:
-            entity_embedding_dim  = entity_embedding.get_output_dim()
-
-        elif concat_entity_embedder is not None:
-            entity_embedding_dim = concat_entity_embedder.get_output_dim()
-            for param in concat_entity_embedder.parameters():
+        entity_embedding_dim = entity_embedding.embedding_dim
+        
+        if type(entity_embedding) == CustomWordNetAllEmbedding:
+            for param in entity_embedding.parameters():
                 param.requires_grad_(False)
-
-            entity_embedding = concat_entity_embedder
-
+        
         if loss_type == 'margin':
             weighted_entity_threshold = decode_threshold
         else:
@@ -858,7 +986,7 @@ class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
                  output_feed_forward_hidden_dim=output_feed_forward_hidden_dim,
                  initializer_range=initializer_range,
                  weighted_entity_threshold=weighted_entity_threshold,
-                 null_entity_id=null_entity_id)
+                 null_embedding=null_embedding)
 
 
     def get_metrics(self, reset: bool = False):
@@ -906,7 +1034,7 @@ class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
 #@Model.register("soldered_kg")
 class CustomSolderedKG(nn.Module):
     def __init__(self,
-                 entity_linker: Model,
+                 entity_linker: nn.Module,
                  span_attention_config: Dict[str, int], 
                  should_init_kg_to_bert_inverse: bool = True,
                  freeze: bool = False):
@@ -1049,15 +1177,19 @@ class CustomSolderedKG(nn.Module):
 #Removed vocab
 class CustomKnowBert(CustomBertPretrainedMetricsLoss):
     def __init__(self,
-                 soldered_kgs: Dict[str, Model],
+                 soldered_kgs: Dict[str, nn.Module],
                  soldered_layers: Dict[str, int],
                  bert_model_name: str,
                  mode: str = None,
                  model_archive: str = None,
                  strict_load_archive: bool = True,
                  debug_cuda: bool = False,
-                 remap_segment_embeddings: int = None):
+                 remap_segment_embeddings: int = None,
+                 state_dict_map:Dict[str,str] = None):
 
+        '''
+        state_dict_map maps from string name in state_dict to new string name to fit
+        '''
         super().__init__()
 
         self.remap_segment_embeddings = remap_segment_embeddings
@@ -1093,6 +1225,16 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
                 # a file object
                 weights_file = fin.extractfile('weights.th')
                 state_dict = torch.load(weights_file, map_location=device_mapping(-1))
+            
+            #Does remapping
+            if(state_dict_map!=None):
+                state_dict = state_dict.copy()
+                metadata = getattr(state_dict, '_metadata', None)
+                if metadata is not None:
+                    state_dict._metadata = metadata
+                for old_key,new_key in state_dict_map.items():
+                    state_dict[new_key] = state_dict.pop(old_key)
+                        
             self.load_state_dict(state_dict, strict=strict_load_archive)
 
         #Token type embeddigns in bert <=> segment embeddings => originally: to which out of 2 sentence the token belongs to
@@ -1204,7 +1346,7 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
         start_layer_index = 0
         loss = 0.0
 
-        #UNCERTAIN: dictionnary that for each soldered kg layer contains a list of the ids of the correct entity in text => can be usd to train the entity linker
+        #NOTE: dictionnary that for each soldered kg layer contains a list of the ids of the correct entity in text => can be usd to train the entity linker
         gold_entities = kwargs.pop('gold_entities', None)
 
         for layer_num, soldered_kg_key in self.layer_to_soldered_kg:
@@ -1266,4 +1408,3 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
         output['contextual_embeddings'] = contextual_embeddings
 
         return output
-

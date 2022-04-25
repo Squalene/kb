@@ -670,8 +670,7 @@ class WordNetAllEmbedding(torch.nn.Module, EntityEmbedder):
         - get list of unique entity ids
         - look up
         - concat POS embedding
-        - linear project
-        - remap to candidate embedding shape
+        - linear project to candidate embedding shape
     """
     POS_MAP = {
         '@@PADDING@@': 0,
