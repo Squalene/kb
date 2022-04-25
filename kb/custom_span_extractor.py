@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 from overrides import overrides
+from typing import Dict, Optional, Tuple, Union
 
-from allennlp.nn import util
+from kb import custom_util as util
 
 class SpanExtractor(nn.Module):
     """
@@ -106,16 +107,6 @@ class SelfAttentiveSpanExtractor(SpanExtractor):
                 sequence_mask: torch.LongTensor = None,
                 span_indices_mask: torch.LongTensor = None) -> torch.FloatTensor:
 
-        #torch.Size([2, 9, 200])
-        print(f"Sequence tensor shape: {sequence_tensor.shape}")
-        #Tuple of span, eg: [1,1]
-        print(f"span_indices: {span_indices.shape} ")
-        #True,False
-        print(f"sequence_mask: {sequence_mask.shape}")
-        #0,1: valis span in the indices tensor => redundant because already [-1,-1] if invalid
-        print(f"span_indices_mask: {span_indices_mask.shape}")
-
-
         dtype = sequence_tensor.dtype
 
         # both of shape (batch_size, num_spans, 1)
@@ -137,10 +128,6 @@ class SelfAttentiveSpanExtractor(SpanExtractor):
 
         # Shape: (1, 1, max_batch_span_width) eg: [[[0,1]]]
         max_span_range_indices = torch.arange(max_batch_span_width, device = sequence_tensor.device).view(1, 1, -1)
-                                                       
-
-        print(f"max_span_range_indices shape: {max_span_range_indices.shape}")
-        print(f"max_span_range_indices : {type(max_span_range_indices)},{max_span_range_indices}")
 
         # Shape: (batch_size, num_spans, max_batch_span_width)
         # This is a broadcasted comparison - for each span we are considering,
@@ -164,15 +151,12 @@ class SelfAttentiveSpanExtractor(SpanExtractor):
         # Shape: (batch_size, num_spans, max_batch_span_width, embedding_dim)
         span_embeddings = util.batched_index_select(sequence_tensor, span_indices, flat_span_indices)
 
-
-        print(f"global_attention_logits shape {global_attention_logits.shape}")
-        print(f"span_indices shape {span_indices.shape}")
         # Shape: (batch_size, num_spans, max_batch_span_width)
         span_attention_logits = util.batched_index_select(global_attention_logits,
                                                           span_indices,
                                                           flat_span_indices).squeeze(-1)
-        print(span_attention_logits.shape)
-        print(span_mask.shape)
+        # print(span_attention_logits.shape)
+        # print(span_mask.shape)
 
         # Shape: (batch_size, num_spans, max_batch_span_width)
         span_attention_weights = util.masked_softmax(span_attention_logits, span_mask,
@@ -193,5 +177,3 @@ class SelfAttentiveSpanExtractor(SpanExtractor):
             return attended_text_embeddings * span_indices_mask.unsqueeze(-1).to(dtype)
 
         return attended_text_embeddings
-
-

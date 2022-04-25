@@ -2,26 +2,23 @@ from typing import Dict, List
 
 import math
 import tarfile
-
-from allennlp.training.metrics import Average, CategoricalAccuracy
-from allennlp.nn.util import device_mapping
-from allennlp.common.file_utils import cached_path
-
-from pytorch_pretrained_bert.modeling import BertForPreTraining, BertLayer, BertLayerNorm, BertConfig, BertEncoder
-
 import torch
+import json
 import torch.nn as nn
 import numpy as np
 import h5py
 
+#from allennlp.training.metrics import Average, CategoricalAccuracy
+
+from kb.custom_metrics import Average, CategoricalAccuracy, WeightedAverage, ExponentialMovingAverage, F1Metric, MeanReciprocalRank
+from kb.custom_util import get_dtype_for_module, extend_attention_mask_for_bert, init_bert_weights
+from allennlp.common.file_utils import cached_path
+
+from pytorch_pretrained_bert.modeling import BertForPreTraining, BertLayer, BertLayerNorm, BertConfig, BertEncoder
+
 from kb.custom_span_extractor import SelfAttentiveSpanExtractor
-from kb.common import JsonFile
-from kb.metrics import MeanReciprocalRank
-from kb.span_attention_layer import SpanAttentionLayer
-from kb.common import get_dtype_for_module, extend_attention_mask_for_bert, init_bert_weights
-from kb.common import F1Metric
-from kb.evaluation.exponential_average_metric import ExponentialMovingAverage
-from kb.evaluation.weighted_average import WeightedAverage
+from kb.custom_span_attention_layer import SpanAttentionLayer
+
 
 
 def print_shapes(x, prefix='', raise_on_nan=False):
@@ -112,8 +109,9 @@ class CustomWordNetAllEmbedding(torch.nn.Module, EntityEmbedder):
             # 'cat.n.01' -> 'n'
             # includes special, e.g. '@@PADDING@@' -> '@@PADDING@@'
             entity_to_pos = {}
-            with JsonFile(cached_path(entity_file), 'r') as fin:
+            with open(cached_path(entity_file), 'r') as fin:
                 for node in fin:
+                    node = json.loads(node)
                     if node['type'] == 'synset':
                         entity_to_pos[node['id']] = node['pos']
             for special in ['@@PADDING@@', '@@MASK@@', '@@NULL@@', '@@UNKNOWN@@']:
@@ -216,7 +214,6 @@ class CustomWordNetAllEmbedding(torch.nn.Module, EntityEmbedder):
 
         # remap to candidate embedding shape
         return projected_entity_and_pos[unique_ids_to_entity_ids].contiguous()
-
 
 class CustomBertPretrainedMetricsLoss(nn.Module):
     def __init__(self):
@@ -337,7 +334,6 @@ class CustomBertPretrainedMaskedLM(CustomBertPretrainedMetricsLoss):
             if new_embeddings is not None:
                 state_dict['bert.bert.embeddings.token_type_embeddings.weight'] = new_embeddings.weight
         super().load_state_dict(state_dict, strict=strict)
-
 
     def forward(self,
                 tokens,
@@ -495,7 +491,6 @@ class DotAttentionWithPrior(nn.Module):
 
         return weighted_entity_embeddings
 
-#@BaseEntityDisambiguator.register("diambiguator")
 class EntityDisambiguator(torch.nn.Module):
     def __init__(self,
                  contextual_embedding_dim: int,
@@ -935,7 +930,6 @@ class CustomEntityLinkingBase(nn.Module):
 
         return {'loss': loss}
 
-#@Model.register("entity_linking_with_candidate_mentions")
 #NOTE: previously inherited from EntityLinkingBase
 #Does equation 1,2,3,4,5
 class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
@@ -1224,7 +1218,10 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
             with tarfile.open(cached_path(model_archive), 'r:gz') as fin:
                 # a file object
                 weights_file = fin.extractfile('weights.th')
-                state_dict = torch.load(weights_file, map_location=device_mapping(-1))
+                if(torch.cuda.is_available()):
+                    state_dict = torch.load(weights_file)
+                else:
+                    state_dict = torch.load(weights_file,map_location='cpu')
             
             #Does remapping
             if(state_dict_map!=None):
