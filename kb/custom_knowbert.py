@@ -1,25 +1,20 @@
 from typing import Dict, List
 
 import math
-import tarfile
 import torch
+import tarfile
 import json
 import torch.nn as nn
 import numpy as np
 import h5py
 
-#from allennlp.training.metrics import Average, CategoricalAccuracy
-
 from kb.custom_metrics import Average, CategoricalAccuracy, WeightedAverage, ExponentialMovingAverage, F1Metric, MeanReciprocalRank
 from kb.custom_util import get_dtype_for_module, extend_attention_mask_for_bert, init_bert_weights
-from allennlp.common.file_utils import cached_path
 
 from pytorch_pretrained_bert.modeling import BertForPreTraining, BertLayer, BertLayerNorm, BertConfig, BertEncoder
 
 from kb.custom_span_extractor import SelfAttentiveSpanExtractor
 from kb.custom_span_attention_layer import SpanAttentionLayer
-
-
 
 def print_shapes(x, prefix='', raise_on_nan=False):
     if isinstance(x, torch.Tensor):
@@ -109,7 +104,7 @@ class CustomWordNetAllEmbedding(torch.nn.Module, EntityEmbedder):
             # 'cat.n.01' -> 'n'
             # includes special, e.g. '@@PADDING@@' -> '@@PADDING@@'
             entity_to_pos = {}
-            with open(cached_path(entity_file), 'r') as fin:
+            with open(entity_file, 'r') as fin:
                 for node in fin:
                     node = json.loads(node)
                     if node['type'] == 'synset':
@@ -119,7 +114,7 @@ class CustomWordNetAllEmbedding(torch.nn.Module, EntityEmbedder):
     
             # list of entity ids
             entities = ['@@PADDING@@']
-            with open(cached_path(vocab_file), 'r') as fin:
+            with open(vocab_file, 'r') as fin:
                 for line in fin:
                     entities.append(line.strip())
     
@@ -138,7 +133,7 @@ class CustomWordNetAllEmbedding(torch.nn.Module, EntityEmbedder):
             self.use_pos = False
 
         # load the embeddings
-        with h5py.File(cached_path(embedding_file), 'r') as fin:
+        with h5py.File(embedding_file, 'r') as fin:
             entity_embeddings = fin[entity_h5_key][...]
         self.entity_embeddings = torch.nn.Embedding(
                 entity_embeddings.shape[0], entity_embeddings.shape[1],
@@ -164,7 +159,7 @@ class CustomWordNetAllEmbedding(torch.nn.Module, EntityEmbedder):
         if include_null_embedding:
             # a special embedding for null
             entities = ['@@PADDING@@']
-            with open(cached_path(vocab_file), 'r') as fin:
+            with open(vocab_file, 'r') as fin:
                 for line in fin:
                     entities.append(line.strip())
             self.null_id = entities.index("@@NULL@@")
@@ -1175,7 +1170,7 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
                  soldered_layers: Dict[str, int],
                  bert_model_name: str,
                  mode: str = None,
-                 model_archive: str = None,
+                 state_dict_file: str = None,
                  strict_load_archive: bool = True,
                  debug_cuda: bool = False,
                  remap_segment_embeddings: int = None,
@@ -1214,14 +1209,11 @@ class CustomKnowBert(CustomBertPretrainedMetricsLoss):
         self.layer_to_soldered_kg.append([num_bert_layers - 1, None])
 
         #Load the model's weights
-        if model_archive is not None:
-            with tarfile.open(cached_path(model_archive), 'r:gz') as fin:
-                # a file object
-                weights_file = fin.extractfile('weights.th')
-                if(torch.cuda.is_available()):
-                    state_dict = torch.load(weights_file)
-                else:
-                    state_dict = torch.load(weights_file,map_location='cpu')
+        if state_dict_file is not None:
+            if(torch.cuda.is_available()):
+                state_dict = torch.load(state_dict_file)
+            else:
+                state_dict = torch.load(state_dict_file,map_location='cpu')
             
             #Does remapping
             if(state_dict_map!=None):
