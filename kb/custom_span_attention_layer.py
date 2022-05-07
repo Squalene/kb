@@ -93,7 +93,7 @@ class SpanAttention(torch.nn.Module):
 class SpanAttentionLayer(torch.nn.Module):
     # WARNING: does it's own init, so don't re-init
     def __init__(self, config):
-        super(SpanAttentionLayer, self).__init__()
+        super().__init__()
         self.attention = SpanAttention(config)
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
