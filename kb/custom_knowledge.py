@@ -140,8 +140,8 @@ class CustomWordNetAllEmbedding(torch.nn.Module, EntityEmbedder):
         # get POS tags from entity ids (form entity id -> pos id embedding)
         # (num_unique_embeddings)
         if self.use_pos:
-            
-            #Reshape to simmulate embedding of size 1
+
+            #Reshape to simulate embedding of size 1
             unique_pos_ids = torch.nn.functional.embedding(unique_ids, self.entity_id_to_pos_index.reshape(-1,1)).flatten().contiguous()
             # (num_unique_embeddings, pos_dim)
             unique_pos_embeddings = self.pos_embeddings(unique_pos_ids).contiguous()
