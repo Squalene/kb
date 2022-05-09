@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from overrides import overrides
 from typing import Dict, Optional, Tuple, Union
 
 from kb import custom_util as util
@@ -16,7 +15,7 @@ class SpanExtractor(nn.Module):
     shape (batch_size, num_spans, ...), forming some representation of the
     spans.
     """
-    @overrides
+
     def forward(self, # pylint: disable=arguments-differ
                 sequence_tensor: torch.FloatTensor,
                 span_indices: torch.LongTensor,
@@ -100,7 +99,6 @@ class SelfAttentiveSpanExtractor(SpanExtractor):
     def get_output_dim(self) -> int:
         return self._input_dim
 
-    @overrides
     def forward(self,
                 sequence_tensor: torch.FloatTensor,
                 span_indices: torch.LongTensor,

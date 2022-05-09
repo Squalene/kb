@@ -73,7 +73,7 @@ class Average(Metric):
         self._count += 1
 
     @overrides
-    def get_metric(self, reset: bool = False):
+    def get_metric(self, reset: bool = False) -> float:
         """
         Returns
         -------
@@ -206,7 +206,7 @@ class WeightedAverage(Metric):
         self._count += count
 
     @overrides
-    def get_metric(self, reset: bool = False):
+    def get_metric(self, reset: bool = False)-> float:
         """
         Returns
         -------
@@ -247,7 +247,7 @@ class ExponentialMovingAverage(Metric):
             self._ema = self.alpha * value + (1.0 - self.alpha) * self._ema
 
     @overrides
-    def get_metric(self, reset: bool = False):
+    def get_metric(self, reset: bool = False)-> float:
         """
         Returns
         -------
