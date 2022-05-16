@@ -1,21 +1,24 @@
-from typing import Dict, List, Sequence, Union
-import copy
 
-import numpy as np
+from typing import Union, List,Dict,Sequence
 
-from allennlp.data.fields import Field, TextField, ListField, SpanField, ArrayField, LabelField
+from allennlp.common import Params
+from allennlp.data import Instance, DataIterator, Vocabulary
+from allennlp.common.file_utils import cached_path
+from allennlp.data.fields import Field, TextField, ListField, SpanField, ArrayField
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
 from allennlp.data import Token
-from pytorch_pretrained_bert.tokenization import BertTokenizer, BasicTokenizer
-
 from kb.dict_field import DictField
-from allennlp.common.registrable import Registrable
-
 from kb.common import MentionGenerator, get_empty_candidates
+
+import copy
+from pytorch_pretrained_bert.tokenization import BertTokenizer, BasicTokenizer
+import numpy as np
 
 start_token = "[CLS]"
 sep_token = "[SEP]"
 
+# from kb.include_all import TokenizerAndCandidateGenerator
+from kb.bert_pretraining_reader import replace_candidates_with_mask_entity
 
 def truncate_sequence_pair(word_piece_tokens_a, word_piece_tokens_b, max_word_piece_sequence_length):
     length_a = sum([len(x) for x in word_piece_tokens_a])
@@ -28,13 +31,85 @@ def truncate_sequence_pair(word_piece_tokens_a, word_piece_tokens_b, max_word_pi
             discarded = word_piece_tokens_a.pop()
             length_a -= len(discarded)
 
+class CustomKnowBertBatchifier:
+    """
+    Takes a list of sentence strings and returns a tensor dict usable with
+    a KnowBert model
+    """
+    def __init__(self, tokenizer_and_candidate_generator, vocabulary, batch_size=32,
+                       masking_strategy=None):
 
-class TokenizerAndCandidateGenerator(Registrable):
-    pass
+        #Given 
+        self.tokenizer_and_candidate_generator = tokenizer_and_candidate_generator 
+        self.tokenizer_and_candidate_generator.whitespace_tokenize = False
+
+        assert masking_strategy is None or masking_strategy == 'full_mask'
+        self.masking_strategy = masking_strategy
+
+        self.vocab = vocabulary
+        self.iterator = DataIterator.from_params(
+            Params({"type": "basic", "batch_size": batch_size})
+        )
+        self.iterator.index_with(self.vocab)
+
+    def _replace_mask(self, s):
+        return s.replace('[MASK]', ' [MASK] ')
+
+    def iter_batches(self, sentences_or_sentence_pairs: Union[List[str], List[List[str]]], verbose=True):
+        # create instances
+        instances = []
+        for sentence_or_sentence_pair in sentences_or_sentence_pairs:
+            if isinstance(sentence_or_sentence_pair, list):
+                assert len(sentence_or_sentence_pair) == 2
+                tokens_candidates = self.tokenizer_and_candidate_generator.\
+                        tokenize_and_generate_candidates(
+                                self._replace_mask(sentence_or_sentence_pair[0]),
+                                self._replace_mask(sentence_or_sentence_pair[1]))
+            else:
+                tokens_candidates = self.tokenizer_and_candidate_generator.\
+                        tokenize_and_generate_candidates(self._replace_mask(sentence_or_sentence_pair))
+
+            if verbose:
+                print(self._replace_mask(sentence_or_sentence_pair))
+                print(tokens_candidates['tokens'])
+
+            # now modify the masking if needed
+            if self.masking_strategy == 'full_mask':
+                # replace the mask span with a @@mask@@ span
+                masked_indices = [index for index, token in enumerate(tokens_candidates['tokens']) if token == '[MASK]']
+
+                spans_to_mask = set([(i, i) for i in masked_indices])
+                replace_candidates_with_mask_entity(
+                        tokens_candidates['candidates'], spans_to_mask
+                )
+
+                # now make sure the spans are actually masked
+                for key in tokens_candidates['candidates'].keys():
+                    for span_to_mask in spans_to_mask:
+                        found = False
+                        for span in tokens_candidates['candidates'][key]['candidate_spans']:
+                            if tuple(span) == tuple(span_to_mask):
+                                found = True
+                        if not found:
+                            tokens_candidates['candidates'][key]['candidate_spans'].append(list(span_to_mask))
+                            tokens_candidates['candidates'][key]['candidate_entities'].append(['@@MASK@@'])
+                            tokens_candidates['candidates'][key]['candidate_entity_priors'].append([1.0])
+                            tokens_candidates['candidates'][key]['candidate_segment_ids'].append(0)
+                            # hack, assume only one sentence
+                            assert not isinstance(sentence_or_sentence_pair, list)
 
 
-@TokenizerAndCandidateGenerator.register("bert_tokenizer_and_candidate_generator")
-class BertTokenizerAndCandidateGenerator(Registrable):
+            fields = self.tokenizer_and_candidate_generator.\
+                convert_tokens_candidates_to_fields(tokens_candidates)
+
+            #print(tokens_candidates)
+            instances.append(Instance(fields))
+
+
+        for batch in self.iterator(instances, num_epochs=1, shuffle=False):
+            yield batch
+
+class BertTokenizerAndCandidateGenerator:
     def __init__(self,
                  entity_candidate_generators: Dict[str, MentionGenerator],
                  entity_indexers: Dict[str, TokenIndexer],
@@ -48,15 +123,6 @@ class BertTokenizerAndCandidateGenerator(Registrable):
         entity_indexers = {'wordnet': indexer for wordnet entities,
                           'wiki': indexer for wiki entities}
         """
-
-        #TODO: remove
-        print("BertTokenizerAndCandidateGenerator params")
-        print(entity_candidate_generators)
-        print(entity_indexers)
-        print(bert_model_type)
-        print(do_lower_case)
-        print(whitespace_tokenize)
-        print(max_word_piece_sequence_length)
 
         # load BertTokenizer from huggingface
         self.candidate_generators = entity_candidate_generators
@@ -301,26 +367,3 @@ class BertTokenizerAndCandidateGenerator(Registrable):
 
         return fields
 
-
-@TokenizerAndCandidateGenerator.register("pretokenized")
-class PretokenizedTokenizerAndCandidateGenerator(BertTokenizerAndCandidateGenerator):
-    """
-    Simple modification to the ``BertTokenizerAndCandidateGenerator``. We assume data comes
-    pre-tokenized, so only wordpiece splitting is performed.
-
-    # TODO: mypy is not going to like us calling ``tokenize_and_generate_candidates()`` on lists
-    # instead of strings. Maybe update type annotations in ``BertTokenizerAndCandidateGenerator``?
-    """
-    def _tokenize_text(self, tokens: List[str]):
-        word_piece_tokens = []
-        offsets = [0]
-        for token in tokens:
-            # Stupid hack
-            if token in ['[SEP]', '[MASK]']:
-                word_pieces = [token]
-            else:
-                word_pieces = self._word_to_word_pieces(token)
-            offsets.append(offsets[-1] + len(word_pieces))
-            word_piece_tokens.append(word_pieces)
-        del offsets[0]
-        return offsets, word_piece_tokens, tokens

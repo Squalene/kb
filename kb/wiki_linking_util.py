@@ -139,6 +139,9 @@ class WikiCandidateMentionGenerator(MentionGenerator):
                  pickle_cache_file: str = None,
                  ):
 
+        #TODO: remove
+        print(f"WikiCandidateMentionGenerator params:",candidates_file,entity_world_path,lowercase_candidates,random_candidates,pickle_cache_file)
+        
         self.tokenizer = spacy.load('en_core_web_sm', disable=['tagger', 'parser', 'ner', 'textcat'])
         self.whitespace_tokenizer = spacy.load('en_core_web_sm', disable=['tagger', 'parser', 'ner', 'textcat'])
         self.whitespace_tokenizer.tokenizer = WhitespaceTokenizer(self.whitespace_tokenizer.vocab)
