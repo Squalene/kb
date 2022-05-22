@@ -293,11 +293,11 @@ class BertTokenizerAndCandidateGenerator(TokenizerAndCandidateGenerator):
         return fields
 
     #TODO: custom
-    def convert_tokens_candidates_to_tensor(self, tokens_and_candidates):
+    def convert_tokens_candidates_to_array(self, tokens_and_candidates, entity_vocabulary):
         """
         tokens_and_candidates is the return from a previous call to
-        generate_sentence_entity_candidates.  Converts the dict to
-        a dict of tensors, except for the entities which remain text
+        generate_sentence_entity_candidates. entity_vocabulary is the vocabulary used to convert from
+        text entiy to ids. Converts the dict to a dict of numpy array
         """
         fields = {}
 
@@ -307,18 +307,31 @@ class BertTokenizerAndCandidateGenerator(TokenizerAndCandidateGenerator):
         
         all_candidates = {}
         for key, entity_candidates in tokens_and_candidates['candidates'].items():
-            # pad the prior to create the array field
-            # make a copy to avoid modifying the input
+            # pad the ids and prior to create 
             candidate_entity_prior = copy.deepcopy(entity_candidates['candidate_entity_priors'])
             max_cands = max(len(p) for p in candidate_entity_prior)
             for p in candidate_entity_prior:
-                if len(p) < max_cands:
-                    p.extend([0.0] * (max_cands - len(p)))
-                    
+                len_diff = max_cands - len(p)
+                if len_diff>0:
+                    p.extend([0.0] * len_diff)
+            
             np_prior = np.array(candidate_entity_prior)
+            
+            candidate_ids = []
+            for mention_candidate_entities in entity_candidates['candidate_entities']:
+                mention_candidate_ids= [entity_vocabulary.get_token_index(entity,namespace='entity') for entity in mention_candidate_entities]
+                candidate_ids.append(mention_candidate_ids)
+            
+            for mention_candidate_ids in candidate_ids:
+                len_diff = max_cands - len(mention_candidate_ids)
+                if len_diff>0:
+                    mention_candidate_ids.extend([0] * len_diff)
+            
+            np_id = np.array(candidate_ids)
+
             #removed candidate entities text
             candidate_fields = {
-                "candidate_entities": entity_candidates['candidate_entities'],
+                "candidate_entity_ids": np_id,
                 "candidate_entity_priors": np_prior,
                 "candidate_spans":np.array(entity_candidates['candidate_spans']),
                 "candidate_segment_ids": np.array(entity_candidates['candidate_segment_ids'])
