@@ -34,7 +34,7 @@ class BertTokenizerAndCandidateGenerator(TokenizerAndCandidateGenerator):
                  whitespace_tokenize: bool = True,
                  max_word_piece_sequence_length: int = 512) -> None:
         """
-        Note: the fields need to be used with a pre-generated allennlp vocabulary
+        Note: the fields need to be used with a pre-generated vocabulary
         that contains the entity id namespaces and the bert name space.
         entity_indexers = {'wordnet': indexer for wordnet entities,
                           'wiki': indexer for wiki entities}
@@ -302,56 +302,3 @@ class PretokenizedTokenizerAndCandidateGenerator(BertTokenizerAndCandidateGenera
             word_piece_tokens.append(word_pieces)
         del offsets[0]
         return offsets, word_piece_tokens, tokens
-
-
-########LEGACY##############
-    #from BertTokenizerAndCandidateGenerator
-    # def convert_tokens_candidates_to_fields(self, tokens_and_candidates):
-    #     """
-    #     tokens_and_candidates is the return from a previous call to
-    #     generate_sentence_entity_candidates.  Converts the dict to
-    #     a dict of fields usable with allennlp.
-    #     """
-    #     fields = {}
-
-    #     fields['tokens'] = TextField(
-    #             [Token(t, text_id=self.bert_tokenizer.vocab[t])
-    #                 for t in tokens_and_candidates['tokens']],
-    #             token_indexers=self._bert_single_id_indexer
-    #     )
-
-    #     fields['segment_ids'] = ArrayField(
-    #         np.array(tokens_and_candidates['segment_ids']), dtype=np.int
-    #     )
-
-    #     all_candidates = {}
-    #     for key, entity_candidates in tokens_and_candidates['candidates'].items():
-    #         # pad the prior to create the array field
-    #         # make a copy to avoid modifying the input
-    #         candidate_entity_prior = copy.deepcopy(
-    #                 entity_candidates['candidate_entity_priors']
-    #         )
-    #         max_cands = max(len(p) for p in candidate_entity_prior)
-    #         for p in candidate_entity_prior:
-    #             if len(p) < max_cands:
-    #                 p.extend([0.0] * (max_cands - len(p)))
-    #         np_prior = np.array(candidate_entity_prior)
-
-    #         candidate_fields = {
-    #             "candidate_entity_priors": ArrayField(np_prior, dtype=self.dtype),
-    #             "candidate_entities": TextField(
-    #                 [Token(" ".join(candidate_list)) for candidate_list in entity_candidates["candidate_entities"]],
-    #                 token_indexers={'ids': self._entity_indexers[key]}),
-    #             "candidate_spans": ListField(
-    #                 [SpanField(span[0], span[1], fields['tokens']) for span in
-    #                 entity_candidates['candidate_spans']]
-    #             ),
-    #             "candidate_segment_ids": ArrayField(
-    #                 np.array(entity_candidates['candidate_segment_ids']), dtype=np.int
-    #     )
-    #         }
-    #         all_candidates[key] = DictField(candidate_fields)
-
-    #     fields["candidates"] = DictField(all_candidates)
-
-    #     return fields

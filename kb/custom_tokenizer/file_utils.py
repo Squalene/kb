@@ -18,11 +18,11 @@ import botocore
 from botocore.exceptions import ClientError
 import requests
 
-from allennlp.common.tqdm import Tqdm
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
-CACHE_ROOT = Path(os.getenv('ALLENNLP_CACHE_ROOT', Path.home() / '.allennlp'))
+CACHE_ROOT = Path(os.getenv('CANLPY_CACHE_ROOT', Path.home() / '.canlpy'))
 CACHE_DIRECTORY = str(CACHE_ROOT / "cache")
 DEPRECATED_CACHE_DIRECTORY = str(CACHE_ROOT / "datasets")
 
@@ -54,7 +54,6 @@ def url_to_filename(url: str, etag: str = None) -> str:
 
     return filename
 
-
 def filename_to_url(filename: str, cache_dir: str = None) -> Tuple[str, str]:
     """
     Return the url and etag (which may be ``None``) stored for `filename`.
@@ -77,7 +76,6 @@ def filename_to_url(filename: str, cache_dir: str = None) -> Tuple[str, str]:
     etag = metadata['etag']
 
     return url, etag
-
 
 def cached_path(url_or_filename: Union[str, Path], cache_dir: str = None) -> str:
     """
@@ -130,7 +128,6 @@ def split_s3_path(url: str) -> Tuple[str, str]:
         s3_path = s3_path[1:]
     return bucket_name, s3_path
 
-
 def s3_request(func: Callable):
     """
     Wrapper function for s3 requests in order to create more helpful error
@@ -149,7 +146,6 @@ def s3_request(func: Callable):
 
     return wrapper
 
-
 def get_s3_resource():
     session = boto3.session.Session()
     if session.get_credentials() is None:
@@ -159,7 +155,6 @@ def get_s3_resource():
         s3_resource = session.resource("s3")
     return s3_resource
 
-
 @s3_request
 def s3_etag(url: str) -> Optional[str]:
     """Check ETag on S3 object."""
@@ -168,7 +163,6 @@ def s3_etag(url: str) -> Optional[str]:
     s3_object = s3_resource.Object(bucket_name, s3_path)
     return s3_object.e_tag
 
-
 @s3_request
 def s3_get(url: str, temp_file: IO) -> None:
     """Pull a file directly from S3."""
@@ -176,18 +170,16 @@ def s3_get(url: str, temp_file: IO) -> None:
     bucket_name, s3_path = split_s3_path(url)
     s3_resource.Bucket(bucket_name).download_fileobj(s3_path, temp_file)
 
-
 def http_get(url: str, temp_file: IO) -> None:
     req = requests.get(url, stream=True)
     content_length = req.headers.get('Content-Length')
     total = int(content_length) if content_length is not None else None
-    progress = Tqdm.tqdm(unit="B", total=total)
+    progress = tqdm(unit="B", total=total)
     for chunk in req.iter_content(chunk_size=1024):
         if chunk: # filter out keep-alive new chunks
             progress.update(len(chunk))
             temp_file.write(chunk)
     progress.close()
-
 
 # TODO(joelgrus): do we want to do checksums or anything like that?
 def get_from_cache(url: str, cache_dir: str = None) -> str:
@@ -246,7 +238,6 @@ def get_from_cache(url: str, cache_dir: str = None) -> str:
 
     return cache_path
 
-
 def read_set_from_file(filename: str) -> Set[str]:
     '''
     Extract a de-duped collection (set) of text from a file.
@@ -257,7 +248,6 @@ def read_set_from_file(filename: str) -> Set[str]:
         for line in file_:
             collection.add(line.rstrip())
     return collection
-
 
 def get_file_extension(path: str, dot=True, lower: bool = True):
     ext = os.path.splitext(path)[1]

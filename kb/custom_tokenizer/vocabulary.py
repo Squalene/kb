@@ -7,17 +7,13 @@ import codecs
 import copy
 import logging
 import os
+import itertools
 from collections import defaultdict
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Union
 from typing import TextIO  # pylint: disable=unused-import
 
-from allennlp.common.util import namespace_match
-from allennlp.common import Params, Registrable
-from allennlp.common.checks import ConfigurationError
-from allennlp.common.tqdm import Tqdm
-from allennlp.common.file_utils import cached_path
-from allennlp.data import instance as adi  # pylint: disable=unused-import
-
+from tqdm import tqdm
+from kb.custom_tokenizer.file_utils import cached_path
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -85,37 +81,31 @@ class _NamespaceDependentDefaultDict(defaultdict):
 
 class _TokenToIndexDefaultDict(_NamespaceDependentDefaultDict):
     def __init__(self, non_padded_namespaces: Set[str], padding_token: str, oov_token: str) -> None:
-        super(_TokenToIndexDefaultDict, self).__init__(non_padded_namespaces,
-                                                       lambda: {padding_token: 0, oov_token: 1},
-                                                       lambda: {})
-
+        super().__init__(non_padded_namespaces,lambda: {padding_token: 0, oov_token: 1},lambda: {})
 
 class _IndexToTokenDefaultDict(_NamespaceDependentDefaultDict):
     def __init__(self, non_padded_namespaces: Set[str], padding_token: str, oov_token: str) -> None:
-        super(_IndexToTokenDefaultDict, self).__init__(non_padded_namespaces,
+        super().__init__(non_padded_namespaces,
                                                        lambda: {0: padding_token, 1: oov_token},
                                                        lambda: {})
 
-
 def _read_pretrained_tokens(embeddings_file_uri: str) -> List[str]:
-    # Moving this import to the top breaks everything (cycling import, I guess)
-    from allennlp.modules.token_embedders.embedding import EmbeddingsTextFile
+    raise NotImplementedError
+    #from allennlp.  import EmbeddingsTextFile
+    # logger.info('Reading pretrained tokens from: %s', embeddings_file_uri)
+    # tokens: List[str] = []
+    # with EmbeddingsTextFile(embeddings_file_uri) as embeddings_file:
+    #     for line_number, line in enumerate(tqdm(embeddings_file), start=1):
+    #         token_end = line.find(' ')
+    #         if token_end >= 0:
+    #             token = line[:token_end]
+    #             tokens.append(token)
+    #         else:
+    #             line_begin = line[:20] + '...' if len(line) > 20 else line
+    #             logger.warning(f'Skipping line number %d: %s', line_number, line_begin)
+    # return tokens
 
-    logger.info('Reading pretrained tokens from: %s', embeddings_file_uri)
-    tokens: List[str] = []
-    with EmbeddingsTextFile(embeddings_file_uri) as embeddings_file:
-        for line_number, line in enumerate(Tqdm.tqdm(embeddings_file), start=1):
-            token_end = line.find(' ')
-            if token_end >= 0:
-                token = line[:token_end]
-                tokens.append(token)
-            else:
-                line_begin = line[:20] + '...' if len(line) > 20 else line
-                logger.warning(f'Skipping line number %d: %s', line_number, line_begin)
-    return tokens
-
-
-def pop_max_vocab_size(params: Params) -> Union[int, Dict[str, int]]:
+def pop_max_vocab_size(params: Dict[str,Any]) -> Union[int, Dict[str, int]]:
     """
     max_vocab_size is allowed to be either an int or a Dict[str, int] (or nothing).
     But it could also be a string representing an int (in the case of environment variable
@@ -123,7 +113,7 @@ def pop_max_vocab_size(params: Params) -> Union[int, Dict[str, int]]:
     """
     size = params.pop("max_vocab_size", None)
 
-    if isinstance(size, Params):
+    if isinstance(size, Dict):
         # This is the Dict[str, int] case.
         return size.as_dict()
     elif size is not None:
@@ -132,8 +122,19 @@ def pop_max_vocab_size(params: Params) -> Union[int, Dict[str, int]]:
     else:
         return None
 
+def namespace_match(pattern: str, namespace: str):
+    """
+    Matches a namespace pattern against a namespace string.  For example, ``*tags`` matches
+    ``passage_tags`` and ``question_tags`` and ``tokens`` matches ``tokens`` but not
+    ``stemmed_tokens``.
+    """
+    if pattern[0] == '*' and namespace.endswith(pattern[1:]):
+        return True
+    elif pattern == namespace:
+        return True
+    return False
 
-class Vocabulary(Registrable):
+class Vocabulary():
     """
     A Vocabulary maps strings to integers, allowing for strings to be mapped to an
     out-of-vocabulary token.
@@ -143,7 +144,7 @@ class Vocabulary(Registrable):
 
     Vocabularies also allow for several different namespaces, so you can have separate indices for
     'a' as a word, and 'a' as a character, for instance, and so we can use this object to also map
-    tag and label strings to indices, for a unified :class:`~.fields.field.Field` API.  Most of the
+    tag and label strings to indices.  Most of the
     methods on this class allow you to pass in a namespace; by default we use the 'tokens'
     namespace, and you can omit the namespace argument everywhere and just use the default.
 
@@ -233,7 +234,6 @@ class Vocabulary(Registrable):
                      only_include_pretrained_words,
                      tokens_to_add,
                      min_pretrained_embeddings)
-
 
     def __getstate__(self):
         """
@@ -403,116 +403,7 @@ class Vocabulary(Registrable):
                 self._index_to_token[namespace][index] = token
         if is_padded:
             assert self._oov_token in self._token_to_index[namespace], "OOV token not found!"
-
-    @classmethod
-    def from_instances(cls,
-                       instances: Iterable['adi.Instance'],
-                       min_count: Dict[str, int] = None,
-                       max_vocab_size: Union[int, Dict[str, int]] = None,
-                       non_padded_namespaces: Iterable[str] = DEFAULT_NON_PADDED_NAMESPACES,
-                       pretrained_files: Optional[Dict[str, str]] = None,
-                       only_include_pretrained_words: bool = False,
-                       tokens_to_add: Dict[str, List[str]] = None,
-                       min_pretrained_embeddings: Dict[str, int] = None) -> 'Vocabulary':
-        """
-        Constructs a vocabulary given a collection of `Instances` and some parameters.
-        We count all of the vocabulary items in the instances, then pass those counts
-        and the other parameters, to :func:`__init__`.  See that method for a description
-        of what the other parameters do.
-        """
-        logger.info("Fitting token dictionary from dataset.")
-        namespace_token_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for instance in Tqdm.tqdm(instances):
-            instance.count_vocab_items(namespace_token_counts)
-
-        return cls(counter=namespace_token_counts,
-                   min_count=min_count,
-                   max_vocab_size=max_vocab_size,
-                   non_padded_namespaces=non_padded_namespaces,
-                   pretrained_files=pretrained_files,
-                   only_include_pretrained_words=only_include_pretrained_words,
-                   tokens_to_add=tokens_to_add,
-                   min_pretrained_embeddings=min_pretrained_embeddings)
-
-    # There's enough logic here to require a custom from_params.
-    @classmethod
-    def from_params(cls, params: Params, instances: Iterable['adi.Instance'] = None):  # type: ignore
-        """
-        There are two possible ways to build a vocabulary; from a
-        collection of instances, using :func:`Vocabulary.from_instances`, or
-        from a pre-saved vocabulary, using :func:`Vocabulary.from_files`.
-        You can also extend pre-saved vocabulary with collection of instances
-        using this method. This method wraps these options, allowing their
-        specification from a ``Params`` object, generated from a JSON
-        configuration file.
-
-        Parameters
-        ----------
-        params: Params, required.
-        instances: Iterable['adi.Instance'], optional
-            If ``params`` doesn't contain a ``directory_path`` key,
-            the ``Vocabulary`` can be built directly from a collection of
-            instances (i.e. a dataset). If ``extend`` key is set False,
-            dataset instances will be ignored and final vocabulary will be
-            one loaded from ``directory_path``. If ``extend`` key is set True,
-            dataset instances will be used to extend the vocabulary loaded
-            from ``directory_path`` and that will be final vocabulary used.
-
-        Returns
-        -------
-        A ``Vocabulary``.
-        """
-        # pylint: disable=arguments-differ
-        # Vocabulary is ``Registrable`` so that you can configure a custom subclass,
-        # but (unlike most of our registrables) almost everyone will want to use the
-        # base implementation. So instead of having an abstract ``VocabularyBase`` or
-        # such, we just add the logic for instantiating a registered subclass here,
-        # so that most users can continue doing what they were doing.
-        vocab_type = params.pop("type", None)
-        if vocab_type is not None:
-            return cls.by_name(vocab_type).from_params(params=params, instances=instances)
-
-        extend = params.pop("extend", False)
-        vocabulary_directory = params.pop("directory_path", None)
-        if not vocabulary_directory and not instances:
-            raise ConfigurationError("You must provide either a Params object containing a "
-                                     "vocab_directory key or a Dataset to build a vocabulary from.")
-        if extend and not instances:
-            raise ConfigurationError("'extend' is true but there are not instances passed to extend.")
-        if extend and not vocabulary_directory:
-            raise ConfigurationError("'extend' is true but there is not 'directory_path' to extend from.")
-
-        if vocabulary_directory and instances:
-            if extend:
-                logger.info("Loading Vocab from files and extending it with dataset.")
-            else:
-                logger.info("Loading Vocab from files instead of dataset.")
-
-        if vocabulary_directory:
-            vocab = cls.from_files(vocabulary_directory)
-            if not extend:
-                params.assert_empty("Vocabulary - from files")
-                return vocab
-        if extend:
-            vocab.extend_from_instances(params, instances=instances)
-            return vocab
-        min_count = params.pop("min_count", None)
-        max_vocab_size = pop_max_vocab_size(params)
-        non_padded_namespaces = params.pop("non_padded_namespaces", DEFAULT_NON_PADDED_NAMESPACES)
-        pretrained_files = params.pop("pretrained_files", {})
-        min_pretrained_embeddings = params.pop("min_pretrained_embeddings", None)
-        only_include_pretrained_words = params.pop_bool("only_include_pretrained_words", False)
-        tokens_to_add = params.pop("tokens_to_add", None)
-        params.assert_empty("Vocabulary - from dataset")
-        return cls.from_instances(instances=instances,
-                                  min_count=min_count,
-                                  max_vocab_size=max_vocab_size,
-                                  non_padded_namespaces=non_padded_namespaces,
-                                  pretrained_files=pretrained_files,
-                                  only_include_pretrained_words=only_include_pretrained_words,
-                                  tokens_to_add=tokens_to_add,
-                                  min_pretrained_embeddings=min_pretrained_embeddings)
-
+   
     def _extend(self,
                 counter: Dict[str, Dict[str, int]] = None,
                 min_count: Dict[str, int] = None,
@@ -551,7 +442,7 @@ class Vocabulary(Registrable):
             extension_padded = not any(namespace_match(pattern, namespace)
                                        for pattern in non_padded_namespaces)
             if original_padded != extension_padded:
-                raise ConfigurationError("Common namespace {} has conflicting ".format(namespace)+
+                raise ValueError("Common namespace {} has conflicting ".format(namespace)+
                                          "setting of padded = True/False. "+
                                          "Hence extension cannot be done.")
 
@@ -592,34 +483,6 @@ class Vocabulary(Registrable):
         for namespace, tokens in tokens_to_add.items():
             for token in tokens:
                 self.add_token_to_namespace(token, namespace)
-
-    def extend_from_instances(self,
-                              params: Params,
-                              instances: Iterable['adi.Instance'] = ()) -> None:
-        """
-        Extends an already generated vocabulary using a collection of instances.
-        """
-        min_count = params.pop("min_count", None)
-        max_vocab_size = pop_max_vocab_size(params)
-        non_padded_namespaces = params.pop("non_padded_namespaces", DEFAULT_NON_PADDED_NAMESPACES)
-        pretrained_files = params.pop("pretrained_files", {})
-        min_pretrained_embeddings = params.pop("min_pretrained_embeddings", None)
-        only_include_pretrained_words = params.pop_bool("only_include_pretrained_words", False)
-        tokens_to_add = params.pop("tokens_to_add", None)
-        params.assert_empty("Vocabulary - from dataset")
-
-        logger.info("Fitting token dictionary from dataset.")
-        namespace_token_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for instance in Tqdm.tqdm(instances):
-            instance.count_vocab_items(namespace_token_counts)
-        self._extend(counter=namespace_token_counts,
-                     min_count=min_count,
-                     max_vocab_size=max_vocab_size,
-                     non_padded_namespaces=non_padded_namespaces,
-                     pretrained_files=pretrained_files,
-                     only_include_pretrained_words=only_include_pretrained_words,
-                     tokens_to_add=tokens_to_add,
-                     min_pretrained_embeddings=min_pretrained_embeddings)
 
     def is_padded(self, namespace: str) -> bool:
         """
@@ -713,7 +576,3 @@ class Vocabulary(Registrable):
             # _retained_counter would be set only if instances were used for vocabulary construction.
             logger.info("Vocabulary statistics cannot be printed since " \
                         "dataset instances were not used for its construction.")
-
-
-# the tricky part is that `Vocabulary` is both the base class and the default implementation
-Vocabulary.register("default")(Vocabulary)
