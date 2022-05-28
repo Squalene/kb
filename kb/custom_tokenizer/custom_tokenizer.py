@@ -5,8 +5,6 @@ import torch
 start_token = "[CLS]"
 sep_token = "[SEP]"
 
-from kb.bert_pretraining_reader import replace_candidates_with_mask_entity
-
 def truncate_sequence_pair(word_piece_tokens_a, word_piece_tokens_b, max_word_piece_sequence_length):
     length_a = sum([len(x) for x in word_piece_tokens_a])
     length_b = sum([len(x) for x in word_piece_tokens_b])
@@ -55,7 +53,6 @@ class CustomKnowBertBatchifier:
                         tokenize_and_generate_candidates(self._replace_mask(sentence_or_sentence_pair))
 
             if verbose:
-                print(self._replace_mask(sentence_or_sentence_pair))
                 print(tokens_candidates['tokens'])
 
             # now modify the masking if needed
@@ -114,9 +111,6 @@ class CustomKnowBertBatchifier:
 
             batch['tokens']['tokens']= np.array(batch['tokens']['tokens'],np.int64)
             batch['segment_ids']= np.array(batch['segment_ids'],np.int64)
-
-            print(f"Batch tokens shape {batch['tokens']['tokens'].shape}")
-            print(f"Batch segment_ids shape { batch['segment_ids'].shape}")
 
             #IMPORTANT: assume the number of candidate entities is already padded inside on instance(done by )
             #=> must padd across multiple instances
@@ -178,6 +172,7 @@ def pad_to_shape(arr,out_shape,value):
     #1D case
     if(len(arr.shape)==1):
         out[:arr.shape[0]]=arr
+    #2D case
     elif(len(arr.shape)==2):
         out[:arr.shape[0],:arr.shape[1]]=arr
     else:
@@ -193,6 +188,18 @@ def convert_to_tensor(dict):
         elif(isinstance(value,Dict)):
             convert_to_tensor(value)
 
+def replace_candidates_with_mask_entity(candidates, spans_to_mask):
+    """
+    candidates = key -> {'candidate_spans': ...}
+    """
+    for candidate_key in candidates.keys():
+        indices_to_mask = []
+        for k, candidate_span in enumerate(candidates[candidate_key]['candidate_spans']):
+            if tuple(candidate_span) in spans_to_mask:
+                indices_to_mask.append(k)
+        for ind in indices_to_mask:
+            candidates[candidate_key]['candidate_entities'][ind] = ['@@MASK@@']
+            candidates[candidate_key]['candidate_entity_priors'][ind] = [1.0]
 
 
             

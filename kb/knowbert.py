@@ -785,17 +785,16 @@ class KnowBert(BertPretrainedMetricsLoss):
 
         super().__init__(vocab, regularizer)
 
-        # print(f"Vocab: {type(vocab)}")
-        # soldered_kg = soldered_kgs['wordnet']
-        # print(f"Soldered kg: {soldered_kgs}")
-        # print(f"Soldered layers: {soldered_layers}")
-        # print(f"bert model name {bert_model_name}")
-        # print(f"mode {mode}")
-        # print(f"model archive {model_archive}")
-        # print(f"strict_load_archive {strict_load_archive}")
-        # print(f"Debug cuda {debug_cuda}")
-        # print(f"remap_segment_embeddings {remap_segment_embeddings}")
-        # print(f"regularizer {regularizer}")
+        print(f"Vocab: {type(vocab)}")
+        print(f"Soldered kg: {soldered_kgs}")
+        print(f"Soldered layers: {soldered_layers}")
+        print(f"bert model name {bert_model_name}")
+        print(f"mode {mode}")
+        print(f"model archive {model_archive}")
+        print(f"strict_load_archive {strict_load_archive}")
+        print(f"Debug cuda {debug_cuda}")
+        print(f"remap_segment_embeddings {remap_segment_embeddings}")
+        print(f"regularizer {regularizer}")
 
         self.remap_segment_embeddings = remap_segment_embeddings
 

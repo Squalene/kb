@@ -231,7 +231,7 @@ class BertTokenizerAndCandidateGenerator(TokenizerAndCandidateGenerator):
             entity_instances[name] = entities
         return entity_instances
 
-    #TODO: custom
+    #custom
     def convert_tokens_candidates_to_array(self, tokens_and_candidates, entity_vocabulary):
         """
         tokens_and_candidates is the return from a previous call to
