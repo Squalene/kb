@@ -591,8 +591,11 @@ class CustomEntityLinkingWithCandidateMentions(CustomEntityLinkingBase):
             null_embedding = entity_embedding.weight[null_entity_id, :]
 
         #NOTE: this model holds no parameter: all the work is done by EntityDisambiguator => can remove this class??
-
-        entity_embedding_dim = entity_embedding.embedding_dim
+        
+        if(type(entity_embedding) == CustomWordNetAllEmbedding):
+            entity_embedding_dim = entity_embedding.embedding_dim
+        else:
+            entity_embedding_dim = entity_embedding.output_dim
         
         if type(entity_embedding) == CustomWordNetAllEmbedding:
             for param in entity_embedding.parameters():

@@ -134,7 +134,7 @@ class CustomKnowBert(CustomPreTrainedKnowbertModel):
                     state_dict._metadata = metadata
                 for old_key,new_key in state_dict_map.items():
                     state_dict[new_key] = state_dict.pop(old_key)
-                        
+                    
             self.load_state_dict(state_dict, strict=strict_load_archive)
 
         #Token type embeddigns in bert <=> segment embeddings => originally: to which out of 2 sentence the token belongs to
